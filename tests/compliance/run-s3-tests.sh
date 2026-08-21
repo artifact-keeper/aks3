@@ -140,8 +140,57 @@ pip install -q -e .
 # as a guard against the server having died during setup.
 require_server_alive "before running the suite"
 
+JUNIT="$DATA/pytest.xml"
 status=0
-S3TEST_CONF="$DATA/s3tests.conf" python -m pytest -q --no-header -p no:cacheprovider "${nodes[@]}" || status=$?
+S3TEST_CONF="$DATA/s3tests.conf" python -m pytest -q --no-header -p no:cacheprovider \
+  --junitxml="$JUNIT" "${nodes[@]}" || status=$?
+
+# pytest's exit status is not the gate on its own. A run whose tests all
+# skipped exits 0, and a skip is exactly what a missing feature looks like from
+# the suite's side: a fixture gives up, the test never runs, and CI goes green
+# over an allowlist that proved nothing. A node ID that no longer resolves after
+# an upstream rename is the same hazard from the other direction. So the gate is
+# the count: every allowlisted node has to have run and passed.
+#
+# The counts come from the JUnit report rather than the "N passed in Ms" line
+# because they are attributes there, not a sentence whose wording and pluralisation
+# move between pytest releases.
+#
+# Reads one attribute off `suite_tag`, the opening <testsuite ...> tag set
+# below. Working from that tag rather than from the whole file is what keeps an
+# assertion message that happens to contain `tests="3"` from being read as a
+# count; the enclosing <testsuites> carries no attributes of its own.
+count_of() {
+  printf '%s\n' "$suite_tag" | tr ' ' '\n' | sed -n "s/^$1=\"\([0-9]*\)\"\$/\1/p"
+}
+
+if [ ! -f "$JUNIT" ]; then
+  echo "pytest wrote no report to $JUNIT; it did not get as far as running the suite" >&2
+  status=1
+else
+  suite_tag="$(tr '\n' ' ' < "$JUNIT" | sed -n 's/.*<testsuite \([^>]*\)>.*/\1/p')"
+  ran="$(count_of tests)"
+  skipped="$(count_of skipped)"
+  failures="$(count_of failures)"
+  errors="$(count_of errors)"
+  for count in "$ran" "$skipped" "$failures" "$errors"; do
+    case "$count" in
+      ''|*[!0-9]*)
+        echo "could not read the test counts out of $JUNIT" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  passed=$((ran - skipped - failures - errors))
+  if [ "$passed" -ne "${#nodes[@]}" ]; then
+    echo "compliance gate: allowlist names ${#nodes[@]} tests, $passed passed" >&2
+    echo "($ran ran, $skipped skipped, $failures failed, $errors errored)" >&2
+    echo "Every allowlisted test must run and pass; a skip is not a pass." >&2
+    status=1
+  fi
+fi
+
 if [ "$status" -ne 0 ]; then
   echo "--- aks3 server log ---" >&2
   cat "$SERVER_LOG" >&2
