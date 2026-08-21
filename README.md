@@ -1,18 +1,24 @@
 # aks3 (working name)
 
-A single-binary S3-compatible object store written in Rust, derived from MinIO's
-engine design. What sets it apart from RustFS (Apache-2.0, young) and Garage
-(AGPL, resilience-focused, eventually consistent) is behavioral fidelity to
-MinIO, strong consistency, and a published, CI-enforced compliance matrix.
+A single-binary S3-compatible object store written in Rust, with a storage
+engine derived from MinIO's design.
+
+Next to the other Rust object stores, aks3 is AGPL where RustFS is Apache-2.0,
+and strongly consistent where Garage is eventually consistent and built for
+resilience across unreliable links. What it is aiming at is behavioral fidelity
+to MinIO backed by compliance results anyone can check. Today that means 18
+tests from the ceph/s3-tests suite, listed in `tests/compliance/allowlist.txt`
+and enforced on every change; the list is small because the suite's teardown
+needs operations Phase 0 does not have yet, and growing it is the roadmap.
 
 ## Origin and license
 
 aks3 is licensed under the GNU Affero General Public License v3.0 only. The full
 text is in `LICENSE`.
 
-Parts of the storage engine, IAM policy evaluation, and encryption design are
-derived from MinIO. See `NOTICE` for the attribution, the pinned reference
-commit, and the trademark statement.
+The storage engine's design is derived from MinIO: the on-disk layout, the write
+discipline, and the locking model. See `NOTICE` for the attribution, the pinned
+reference commit, and the trademark statement.
 
 ## Status
 
