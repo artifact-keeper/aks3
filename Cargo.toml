@@ -30,6 +30,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml = "0.8"
+http = "1"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
 http-body-util = "0.1"
