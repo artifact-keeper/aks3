@@ -17,3 +17,101 @@ commit, and the trademark statement.
 ## Status
 
 Status: pre-alpha, Phase 0.
+
+Phase 0 is a single node serving one data directory. Nine S3 operations are
+implemented: `CreateBucket`, `HeadBucket`, `DeleteBucket`, `ListBuckets`,
+`PutObject`, `GetObject` (including byte ranges), `HeadObject`, `DeleteObject`,
+and `ListObjectsV2` with prefixes, delimiters, and pagination. Requests are
+authenticated with SigV4 against a single root credential.
+
+## Quickstart
+
+Build the binary:
+
+```
+cargo build --release
+```
+
+Write `aks3.toml`:
+
+```toml
+listen = "127.0.0.1:9000"
+data_dir = "./data"
+root_access_key = "admin"
+root_secret_key = "secretpassword"
+```
+
+Run it:
+
+```
+./target/release/aks3 --config aks3.toml
+```
+
+The data directory is created if it is not there, and the server logs the
+address it bound before it accepts anything.
+
+### Configuration
+
+`listen` defaults to `127.0.0.1:9000` and `data_dir` to `./data`. The root
+credentials have no default and have to be set, so the shortest config that
+works is those two lines on their own.
+
+Four environment variables override the file, which is what lets an image ship
+a config and still take its credentials at run time:
+
+| Variable | Sets |
+|----------|------|
+| `AKS3_LISTEN` | `listen` |
+| `AKS3_DATA_DIR` | `data_dir` |
+| `AKS3_ROOT_USER` | `root_access_key` |
+| `AKS3_ROOT_PASSWORD` | `root_secret_key` |
+
+With the credentials in the environment there is no need for a file at all:
+
+```
+AKS3_ROOT_USER=admin AKS3_ROOT_PASSWORD=secretpassword ./target/release/aks3
+```
+
+For TLS, add a `[tls]` table naming a PEM certificate chain and its private key.
+Without one the server speaks plain HTTP, which is the Phase 0 default.
+
+```toml
+[tls]
+cert_pem = "/etc/aks3/cert.pem"
+key_pem = "/etc/aks3/key.pem"
+```
+
+### Talking to it
+
+```
+export AWS_ACCESS_KEY_ID=admin
+export AWS_SECRET_ACCESS_KEY=secretpassword
+export AWS_REGION=us-east-1
+export AWS_S3_ADDRESSING_STYLE=path
+
+aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://demo
+aws --endpoint-url http://127.0.0.1:9000 s3 cp README.md s3://demo/readme.md
+aws --endpoint-url http://127.0.0.1:9000 s3 ls s3://demo/
+aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://demo/readme.md
+aws --endpoint-url http://127.0.0.1:9000 s3 rb s3://demo
+```
+
+Path-style addressing is required. aks3 does not parse virtual-host style
+(`bucket.host`) requests yet, so a client that resolves buckets into hostnames
+will not find them.
+
+The same operations driven from the AWS SDK for Rust are what
+`crates/server/tests/smoke.rs` runs on every `cargo test`.
+
+### Known limitations
+
+- One node and one data directory. No erasure coding, no replication, no
+  distributed mode.
+- No multipart upload, so an object is limited to what one `PutObject` can
+  carry. No `CopyObject`, no batch `DeleteObjects`, and no versioning API.
+- One root credential. No additional users, groups, or policies.
+- Object keys become paths under `data_dir`, and letter case is kept as the
+  client sent it. On a case-insensitive filesystem, which is the macOS default
+  for APFS volumes, that makes `photo.jpg` and `Photo.JPG` one object where S3
+  has two. Use a case-sensitive volume for anything that matters. Linux
+  filesystems are already case-sensitive.

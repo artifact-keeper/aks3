@@ -26,13 +26,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "v7"] }
 md-5 = "0.10"
+anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml = "0.8"
 http = "1"
 hyper = "1"
-hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "tokio", "service"] }
 http-body-util = "0.1"
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
