@@ -15,7 +15,10 @@
 //!   buckets/
 //!     <bucket>/
 //!       .bucket.meta       { "created_epoch_ms": u64 }
-//!       objects/           the object tree (Tasks 6 and 7)
+//!       objects/
+//!         <encoded-key>/
+//!           __aks3.meta.json     the key's version manifest
+//!           __aks3.v.null.data   the bytes of one version
 //! ```
 //!
 //! Buckets live under `buckets/` rather than directly under `<root>` so that a
@@ -51,19 +54,59 @@
 //! `open` therefore assumes no other process is writing to the same `<root>`:
 //! it is a startup step, and a second live engine would have its in-flight
 //! staged files deleted underneath it. aks3 runs one engine per data directory.
+//!
+//! # Concurrency
+//!
+//! The filesystem gives atomicity for a single rename and nothing above it. Two
+//! in-process locks supply the rest, and they are always taken in this order:
+//!
+//! 1. **The bucket lock**, an `RwLock` per bucket name. Every write to an
+//!    object takes it *shared*; [`FsEngine::delete_bucket`] and
+//!    [`FsEngine::create_bucket`] take it *exclusively*. Without this,
+//!    `delete_bucket`'s emptiness check and its `remove_dir_all` are two steps
+//!    with a gap, and an object published in that gap is destroyed by a call
+//!    that reported the bucket as empty.
+//! 2. **The key lock**, a `Mutex` per (bucket, key). It serialises the
+//!    *publication* of a write: the data commit and the manifest update, which
+//!    are two renames that must not interleave with another writer's. Streaming
+//!    a body into the staging directory happens before the lock is taken, so a
+//!    slow upload never blocks another writer, and `delete_bucket` waits only
+//!    for publications, not for transfers.
+//!
+//! Both tables drop an entry once nothing holds it, so they stay the size of
+//! the concurrent work rather than growing with every key ever written.
+//!
+//! Reads take neither lock. A `GET` racing a `DELETE` of the same key reports
+//! whichever state it observed, which is what S3 promises; holding a lock for
+//! the life of a response stream would let one slow reader block every writer.
+//!
+//! The locks live in this process, so they order the requests one server
+//! handles. Two servers over one data directory are not supported, as
+//! [`FsEngine::open`]'s temp sweep already assumes.
 
-use std::io;
+use std::hash::Hash;
+use std::io::{self, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use dashmap::DashMap;
+use futures::StreamExt;
+use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
-use crate::atomic::write_json_atomic;
+use crate::atomic::{write_json_atomic, StagedFile};
 use crate::error::EngineError;
 use crate::layer::{
     BoxByteStream, BucketInfo, ByteRange, ListParams, ListResult, ObjectInfo, ObjectLayer, PutOpts,
 };
+use crate::meta::{
+    load_manifest, store_manifest, VersionEntry, VersionManifest, MANIFEST_FORMAT, NULL_VERSION_ID,
+};
+use crate::paths::{data_file_name, key_to_rel_path, META_FILE};
 
 /// Layout version stamped on `<root>/.aks3/format.json`.
 ///
@@ -83,6 +126,10 @@ const BUCKETS_DIR: &str = "buckets";
 const BUCKET_META_FILE: &str = ".bucket.meta";
 /// Object tree, inside a bucket directory.
 const OBJECTS_DIR: &str = "objects";
+/// Content type recorded for a `PUT` that did not declare one.
+const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
+/// Bytes read per chunk of a `GET` body stream.
+const READ_CHUNK: usize = 64 * 1024;
 
 /// Contents of `<root>/.aks3/format.json`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -100,6 +147,65 @@ struct BucketMeta {
 #[derive(Debug)]
 pub struct FsEngine {
     root: PathBuf,
+    /// See the module's concurrency note. Keyed by bucket name.
+    bucket_locks: DashMap<String, Arc<RwLock<()>>>,
+    /// See the module's concurrency note. Keyed by (bucket, key).
+    key_locks: DashMap<(String, String), Arc<Mutex<()>>>,
+}
+
+/// A held lock from one of [`FsEngine`]'s lock tables, which takes its own
+/// entry out of the table on release.
+///
+/// A table entry is only useful while some task is holding or waiting for it;
+/// keeping it afterwards would grow the table by one `Arc` for every key the
+/// server ever writes. Removal is conditional on the entry's strong count
+/// being 1, meaning the table is its only holder, and `DashMap` evaluates that
+/// predicate while holding the shard lock that any other task would need to
+/// clone the `Arc`. So an entry is only ever dropped when no task can be about
+/// to lock it, and two tasks can never end up holding different locks for the
+/// same key.
+struct LockEntry<'a, K, L, G>
+where
+    K: Eq + Hash,
+{
+    table: &'a DashMap<K, Arc<L>>,
+    key: K,
+    /// `Option` only so that [`Drop`] can drop the guard before the entry it
+    /// belongs to; always `Some` until then.
+    guard: Option<G>,
+}
+
+/// A held shared bucket lock. See the module's concurrency note.
+type BucketReadLock<'a> = LockEntry<'a, String, RwLock<()>, OwnedRwLockReadGuard<()>>;
+/// A held exclusive bucket lock.
+type BucketWriteLock<'a> = LockEntry<'a, String, RwLock<()>, OwnedRwLockWriteGuard<()>>;
+/// A held per-key lock.
+type KeyLock<'a> = LockEntry<'a, (String, String), Mutex<()>, OwnedMutexGuard<()>>;
+
+impl<'a, K, L, G> LockEntry<'a, K, L, G>
+where
+    K: Eq + Hash,
+{
+    fn new(table: &'a DashMap<K, Arc<L>>, key: K, guard: G) -> Self {
+        Self {
+            table,
+            key,
+            guard: Some(guard),
+        }
+    }
+}
+
+impl<K, L, G> Drop for LockEntry<'_, K, L, G>
+where
+    K: Eq + Hash,
+{
+    fn drop(&mut self) {
+        // Releasing first is what lets the count reach 1: the guard owns the
+        // `Arc` clone this lock was taken through.
+        drop(self.guard.take());
+        self.table
+            .remove_if(&self.key, |_, lock| Arc::strong_count(lock) == 1);
+    }
 }
 
 impl FsEngine {
@@ -114,7 +220,11 @@ impl FsEngine {
     /// [`EngineError::Io`] if the layout cannot be created or read, or if the
     /// directory was written by a build with a newer [`DISK_FORMAT`].
     pub async fn open(root: impl Into<PathBuf>) -> Result<Self, EngineError> {
-        let engine = Self { root: root.into() };
+        let engine = Self {
+            root: root.into(),
+            bucket_locks: DashMap::new(),
+            key_locks: DashMap::new(),
+        };
         // The temp directory first: write_json_atomic stages through it, so it
         // has to exist before anything below writes a file.
         fs::create_dir_all(engine.tmp_dir()).await?;
@@ -152,6 +262,54 @@ impl FsEngine {
         } else {
             Err(EngineError::InvalidBucketName)
         }
+    }
+
+    /// [`Self::checked_bucket_dir`] for a bucket that must already exist.
+    ///
+    /// The object methods all start here: S3 distinguishes "no such bucket"
+    /// from "no such key", and on disk both are just a missing directory.
+    async fn existing_bucket_dir(&self, b: &str) -> Result<PathBuf, EngineError> {
+        let dir = self.checked_bucket_dir(b)?;
+        match fs::metadata(&dir).await {
+            Ok(m) if m.is_dir() => Ok(dir),
+            // A non-directory here was not made by create_bucket, and
+            // bucket_exists already reports it as absent.
+            Ok(_) => Err(EngineError::NoSuchBucket),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(EngineError::NoSuchBucket),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// `<root>/buckets/<b>/objects/<encoded key>`, the directory holding one
+    /// key's manifest and data files.
+    fn object_dir(bucket_dir: &Path, key: &str) -> PathBuf {
+        bucket_dir.join(OBJECTS_DIR).join(key_to_rel_path(key))
+    }
+
+    /// Take the bucket lock shared, for a write that must not have the bucket
+    /// removed underneath it. See the module's concurrency note.
+    async fn lock_bucket_shared(&self, bucket: &str) -> BucketReadLock<'_> {
+        let lock = Arc::clone(&self.bucket_locks.entry(bucket.to_owned()).or_default());
+        let guard = lock.read_owned().await;
+        LockEntry::new(&self.bucket_locks, bucket.to_owned(), guard)
+    }
+
+    /// Take the bucket lock exclusively, excluding every object write to it.
+    async fn lock_bucket_exclusive(&self, bucket: &str) -> BucketWriteLock<'_> {
+        let lock = Arc::clone(&self.bucket_locks.entry(bucket.to_owned()).or_default());
+        let guard = lock.write_owned().await;
+        LockEntry::new(&self.bucket_locks, bucket.to_owned(), guard)
+    }
+
+    /// Take the key lock, serialising publication of writes to one key.
+    ///
+    /// Always taken after [`Self::lock_bucket_shared`], never before: one
+    /// order, so two writers cannot each hold what the other is waiting for.
+    async fn lock_key(&self, bucket: &str, key: &str) -> KeyLock<'_> {
+        let id = (bucket.to_owned(), key.to_owned());
+        let lock = Arc::clone(&self.key_locks.entry(id.clone()).or_default());
+        let guard = lock.lock_owned().await;
+        LockEntry::new(&self.key_locks, id, guard)
     }
 
     /// Delete everything in the staging directory.
@@ -217,6 +375,9 @@ impl FsEngine {
 impl ObjectLayer for FsEngine {
     async fn create_bucket(&self, bucket: &str) -> Result<(), EngineError> {
         let dir = self.checked_bucket_dir(bucket)?;
+        // Excludes delete_bucket, so a name is never reported as taken by a
+        // create that a concurrent delete then takes away underneath it.
+        let _bucket_lock = self.lock_bucket_exclusive(bucket).await;
         // create_dir, not create_dir_all: it fails when the name is taken, which
         // makes "does it exist" and "claim it" one step. Checking first and
         // creating after would let two concurrent creates both succeed.
@@ -245,6 +406,11 @@ impl ObjectLayer for FsEngine {
 
     async fn delete_bucket(&self, bucket: &str) -> Result<(), EngineError> {
         let dir = self.checked_bucket_dir(bucket)?;
+        // Held across the emptiness check and the removal below, which are
+        // otherwise two steps with a gap: a PUT that published in that gap
+        // would be destroyed by a call that had just found the bucket empty.
+        // Every object write takes this lock shared, so none is in flight here.
+        let _bucket_lock = self.lock_bucket_exclusive(bucket).await;
         if !fs::try_exists(&dir).await? {
             return Err(EngineError::NoSuchBucket);
         }
@@ -311,31 +477,143 @@ impl ObjectLayer for FsEngine {
         Ok(out)
     }
 
+    /// Stage the body, then publish it under the key's locks.
+    ///
+    /// The bytes are streamed into `.aks3/tmp` before any lock is taken, so an
+    /// upload the size of a disk does not hold up another writer. Only the two
+    /// renames that publish it, the data file and then the manifest, happen
+    /// under the locks.
+    ///
+    /// Data lands before the manifest that points at it. A crash between the
+    /// two leaves bytes nothing refers to, which the next `PUT` replaces; the
+    /// other order would leave a manifest promising a version whose data never
+    /// arrived.
+    ///
+    /// # A known Phase 0 window
+    ///
+    /// Unversioned writes reuse one data file name, so an overwrite replaces
+    /// the previous object's bytes in place. Between that rename and the
+    /// manifest write, a concurrent reader can see the new bytes described by
+    /// the old entry: a shorter object reads as the [`io::ErrorKind`]
+    /// `UnexpectedEof` [`file_stream`] reports, a longer one as a prefix of the
+    /// new object under the old etag. Writers do not see it, since publication
+    /// is serialised by the key lock, and it closes as soon as versioning mints
+    /// a version id per `PUT` and leaves the previous data file where it is.
     async fn put_object(
         &self,
-        _bucket: &str,
-        _key: &str,
-        _body: BoxByteStream,
-        _opts: PutOpts,
+        bucket: &str,
+        key: &str,
+        mut body: BoxByteStream,
+        opts: PutOpts,
     ) -> Result<ObjectInfo, EngineError> {
-        Err(not_yet_implemented())
+        // Checked up front so a PUT to a bucket that is not there fails before
+        // reading the body, and again under the lock below, which is the check
+        // that actually holds.
+        let bucket_dir = self.existing_bucket_dir(bucket).await?;
+
+        let mut staged = StagedFile::create(&self.tmp_dir()).await?;
+        let mut hasher = Md5::new();
+        let mut size: u64 = 0;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk?;
+            hasher.update(&chunk);
+            size += chunk.len() as u64;
+            staged.write_all(&chunk).await?;
+        }
+
+        let entry = VersionEntry {
+            version_id: NULL_VERSION_ID.to_owned(),
+            etag: hex_lower(&hasher.finalize()),
+            size,
+            content_type: opts
+                .content_type
+                .filter(|c| !c.is_empty())
+                .unwrap_or_else(|| DEFAULT_CONTENT_TYPE.to_owned()),
+            user_metadata: opts.user_metadata,
+            mtime_epoch_ms: now_epoch_ms(),
+            delete_marker: false,
+        };
+
+        let _bucket_lock = self.lock_bucket_shared(bucket).await;
+        let _key_lock = self.lock_key(bucket, key).await;
+        // The bucket lock is held now, so delete_bucket cannot be between its
+        // emptiness check and its remove_dir_all. Re-checking here is what
+        // stops the commit below from re-creating a tree under a bucket that
+        // was deleted while the body was still arriving.
+        self.existing_bucket_dir(bucket).await?;
+
+        let dir = Self::object_dir(&bucket_dir, key);
+        staged
+            .commit(&dir.join(data_file_name(NULL_VERSION_ID)))
+            .await?;
+
+        let mut manifest = load_manifest(&dir.join(META_FILE))
+            .await?
+            .unwrap_or_else(new_manifest);
+        manifest.upsert(entry.clone());
+        store_manifest(&self.tmp_dir(), &dir.join(META_FILE), &manifest).await?;
+
+        Ok(object_info(key.to_owned(), &entry))
     }
 
     async fn get_object(
         &self,
-        _bucket: &str,
-        _key: &str,
-        _range: Option<ByteRange>,
+        bucket: &str,
+        key: &str,
+        range: Option<ByteRange>,
     ) -> Result<(ObjectInfo, u64, u64, BoxByteStream), EngineError> {
-        Err(not_yet_implemented())
+        let dir = Self::object_dir(&self.existing_bucket_dir(bucket).await?, key);
+        let entry = live_version(&dir).await?;
+        let (offset, len) = resolve_range(range, entry.size)?;
+
+        let mut file = fs::File::open(dir.join(data_file_name(&entry.version_id))).await?;
+        if offset > 0 {
+            file.seek(SeekFrom::Start(offset)).await?;
+        }
+        let info = object_info(key.to_owned(), &entry);
+        Ok((info, offset, len, file_stream(file, len)))
     }
 
-    async fn head_object(&self, _bucket: &str, _key: &str) -> Result<ObjectInfo, EngineError> {
-        Err(not_yet_implemented())
+    async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectInfo, EngineError> {
+        let dir = Self::object_dir(&self.existing_bucket_dir(bucket).await?, key);
+        let entry = live_version(&dir).await?;
+        Ok(object_info(key.to_owned(), &entry))
     }
 
-    async fn delete_object(&self, _bucket: &str, _key: &str) -> Result<(), EngineError> {
-        Err(not_yet_implemented())
+    /// Remove the key's manifest and data, then prune the directories that
+    /// held them.
+    ///
+    /// The manifest goes first. A crash after it leaves data files nothing
+    /// points at, which read as an absent object and are swept by the next
+    /// write to the key; removing the data first would leave a manifest
+    /// advertising a version whose bytes are gone, which reads as a corrupt
+    /// object rather than a deleted one.
+    ///
+    /// Deleting a key that is not there succeeds, as it does in S3.
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), EngineError> {
+        let bucket_dir = self.existing_bucket_dir(bucket).await?;
+        let _bucket_lock = self.lock_bucket_shared(bucket).await;
+        let _key_lock = self.lock_key(bucket, key).await;
+
+        let dir = Self::object_dir(&bucket_dir, key);
+        remove_if_present(&dir.join(META_FILE)).await?;
+        // Phase 0 writes exactly one version, and reading the manifest to find
+        // the others would make a corrupt manifest an object that cannot be
+        // deleted. Versioned deletes arrive with versioning itself.
+        remove_if_present(&dir.join(data_file_name(NULL_VERSION_ID))).await?;
+
+        let objects_dir = bucket_dir.join(OBJECTS_DIR);
+        prune_empty_dirs(&dir, &objects_dir).await;
+        // Whichever directory the removals last changed. Without this fsync a
+        // crash can bring a deleted object back.
+        if let Some(deepest) = deepest_existing(&dir, &objects_dir).await {
+            if let Err(e) = fsync_dir(&deepest).await {
+                if e.kind() != io::ErrorKind::NotFound {
+                    return Err(e.into());
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn list_objects_v2(
@@ -456,8 +734,200 @@ async fn fsync_dir(dir: &Path) -> io::Result<()> {
     fs::File::open(dir).await?.sync_all().await
 }
 
-/// The five object methods land in Tasks 6 and 7. Until then they fail loudly
-/// rather than pretending an empty store.
+/// An empty manifest for a key that has never been written.
+fn new_manifest() -> VersionManifest {
+    VersionManifest {
+        format: MANIFEST_FORMAT,
+        versions: Vec::new(),
+    }
+}
+
+/// `entry` as the API layer sees it.
+fn object_info(key: String, entry: &VersionEntry) -> ObjectInfo {
+    ObjectInfo {
+        key,
+        size: entry.size,
+        etag: entry.etag.clone(),
+        content_type: entry.content_type.clone(),
+        mtime_epoch_ms: entry.mtime_epoch_ms,
+        user_metadata: entry.user_metadata.clone(),
+    }
+}
+
+/// The version a `GET` or `HEAD` of the object at `dir` resolves to.
+///
+/// A key with no manifest and a key whose latest version is a delete marker
+/// are the same thing to a client: the object is not there.
+///
+/// # Errors
+///
+/// [`EngineError::NoSuchKey`] for either of those. A manifest that exists but
+/// cannot be read propagates as [`EngineError::Io`], since presenting a
+/// corrupt history as an absent object would invite the next write to
+/// overwrite it.
+async fn live_version(dir: &Path) -> Result<VersionEntry, EngineError> {
+    let manifest = load_manifest(&dir.join(META_FILE))
+        .await?
+        .ok_or(EngineError::NoSuchKey)?;
+    match manifest.latest() {
+        Some(e) if !e.delete_marker => Ok(e.clone()),
+        _ => Err(EngineError::NoSuchKey),
+    }
+}
+
+/// Resolve `range` against an object of `size` bytes, yielding the offset to
+/// read from and the number of bytes to send.
+///
+/// The bounds in [`ByteRange`] are inclusive, as HTTP's are. A range that
+/// starts past the last byte is unsatisfiable; one that merely *ends* past it
+/// is clamped, which is what makes `bytes=0-` work on any object.
+///
+/// # Errors
+///
+/// [`EngineError::InvalidRange`], which the API layer reports as a 416.
+fn resolve_range(range: Option<ByteRange>, size: u64) -> Result<(u64, u64), EngineError> {
+    let Some(range) = range else {
+        return Ok((0, size));
+    };
+    // No byte of an empty object can be in range, including `bytes=-0`, which
+    // is unsatisfiable at any size.
+    if size == 0 {
+        return Err(EngineError::InvalidRange);
+    }
+    match range {
+        ByteRange::FromTo(first, last) => {
+            if first > last || first >= size {
+                return Err(EngineError::InvalidRange);
+            }
+            let last = last.min(size - 1);
+            Ok((first, last - first + 1))
+        }
+        ByteRange::From(first) => {
+            if first >= size {
+                return Err(EngineError::InvalidRange);
+            }
+            Ok((first, size - first))
+        }
+        ByteRange::Suffix(n) => {
+            if n == 0 {
+                return Err(EngineError::InvalidRange);
+            }
+            let n = n.min(size);
+            Ok((size - n, n))
+        }
+    }
+}
+
+/// Stream `len` bytes from `file`, starting wherever it is positioned.
+///
+/// Chunked rather than read whole: an object is as large as a client cares to
+/// make it, and a `GET` must not need it all in memory.
+///
+/// A file that runs out early is an error, not a short body. It means the data
+/// file no longer matches the manifest that described it, and reporting the
+/// bytes as complete would hand the client a silently truncated object.
+fn file_stream(file: fs::File, len: u64) -> BoxByteStream {
+    futures::stream::unfold((file, len), |(mut file, remaining)| async move {
+        if remaining == 0 {
+            return None;
+        }
+        let want = usize::try_from(remaining)
+            .unwrap_or(READ_CHUNK)
+            .min(READ_CHUNK);
+        let mut buf = vec![0_u8; want];
+        let mut filled = 0;
+        while filled < want {
+            match file.read(&mut buf[filled..]).await {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                // `remaining` of 0 ends the stream after this item: a reader
+                // that polls again gets `None`, not a retry of a failed read.
+                Err(e) => return Some((Err(e), (file, 0))),
+            }
+        }
+        if filled == 0 {
+            let e = io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "object data file is shorter than its manifest records",
+            );
+            return Some((Err(e), (file, 0)));
+        }
+        buf.truncate(filled);
+        Some((
+            Ok(bytes::Bytes::from(buf)),
+            (file, remaining - filled as u64),
+        ))
+    })
+    .boxed()
+}
+
+/// Remove `path`, treating "it was not there" as success.
+async fn remove_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove `dir` and each parent up to but excluding `stop`, stopping at the
+/// first one that is not empty.
+///
+/// Best effort. A directory that could not be pruned costs an empty directory
+/// and keeps its bucket from being deleted until something removes it; failing
+/// the `DELETE` over it would be worse, since the object itself is already
+/// gone.
+async fn prune_empty_dirs(dir: &Path, stop: &Path) {
+    let mut current = dir;
+    while current != stop && current.starts_with(stop) {
+        if let Err(e) = fs::remove_dir(current).await {
+            if e.kind() != io::ErrorKind::NotFound && e.kind() != io::ErrorKind::DirectoryNotEmpty {
+                tracing::warn!(path = %current.display(), error = %e, "could not prune directory");
+            }
+            return;
+        }
+        let Some(parent) = current.parent() else {
+            return;
+        };
+        current = parent;
+    }
+}
+
+/// The deepest of `dir` and its parents up to `stop` that still exists.
+///
+/// After a delete that is the directory whose entries changed last, and so the
+/// one whose removal has to be made durable.
+async fn deepest_existing(dir: &Path, stop: &Path) -> Option<PathBuf> {
+    let mut current = dir;
+    loop {
+        if fs::try_exists(current).await.unwrap_or(false) {
+            return Some(current.to_path_buf());
+        }
+        if current == stop {
+            return None;
+        }
+        current = current.parent()?;
+        if !current.starts_with(stop) {
+            return None;
+        }
+    }
+}
+
+/// `bytes` as lowercase hex, the form an S3 etag takes.
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: [char; 16] = [
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+    ];
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize]);
+        out.push(HEX[(b & 0x0F) as usize]);
+    }
+    out
+}
+
+/// The listing method lands in Task 7. Until then it fails loudly rather than
+/// pretending an empty store.
 fn not_yet_implemented() -> EngineError {
     EngineError::Io(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -475,6 +945,112 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let e = FsEngine::open(d.path()).await.unwrap();
         (d, e)
+    }
+
+    fn body(b: &'static [u8]) -> BoxByteStream {
+        futures::stream::iter(vec![Ok(bytes::Bytes::from_static(b))]).boxed()
+    }
+
+    async fn read_all(mut s: BoxByteStream) -> Vec<u8> {
+        let mut out = vec![];
+        while let Some(c) = s.next().await {
+            out.extend_from_slice(&c.unwrap());
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn put_get_roundtrip() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        let info = e
+            .put_object(
+                "buk",
+                "dir/hello.txt",
+                body(b"hello world"),
+                PutOpts::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.size, 11);
+        assert_eq!(info.etag, "5eb63bbbe01eeed093cb22bb8f5acdc3"); // md5("hello world")
+        let (gi, off, len, s) = e.get_object("buk", "dir/hello.txt", None).await.unwrap();
+        assert_eq!((gi.size, off, len), (11, 0, 11));
+        assert_eq!(read_all(s).await, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn ranged_get() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        e.put_object("buk", "k", body(b"0123456789"), PutOpts::default())
+            .await
+            .unwrap();
+        let (_, off, len, s) = e
+            .get_object("buk", "k", Some(ByteRange::FromTo(2, 5)))
+            .await
+            .unwrap();
+        assert_eq!((off, len), (2, 4));
+        assert_eq!(read_all(s).await, b"2345");
+        let (_, off, len, s) = e
+            .get_object("buk", "k", Some(ByteRange::Suffix(3)))
+            .await
+            .unwrap();
+        assert_eq!((off, len), (7, 3));
+        assert_eq!(read_all(s).await, b"789");
+        assert!(matches!(
+            e.get_object("buk", "k", Some(ByteRange::From(10))).await,
+            Err(EngineError::InvalidRange)
+        ));
+    }
+
+    #[tokio::test]
+    async fn overwrite_replaces() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        e.put_object("buk", "k", body(b"one"), PutOpts::default())
+            .await
+            .unwrap();
+        e.put_object("buk", "k", body(b"two!"), PutOpts::default())
+            .await
+            .unwrap();
+        let (i, _, _, s) = e.get_object("buk", "k", None).await.unwrap();
+        assert_eq!(i.size, 4);
+        assert_eq!(read_all(s).await, b"two!");
+    }
+
+    #[tokio::test]
+    async fn delete_and_missing() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        e.put_object("buk", "x/y", body(b"z"), PutOpts::default())
+            .await
+            .unwrap();
+        e.delete_object("buk", "x/y").await.unwrap();
+        assert!(matches!(
+            e.head_object("buk", "x/y").await,
+            Err(EngineError::NoSuchKey)
+        ));
+        e.delete_object("buk", "x/y").await.unwrap(); // idempotent
+        assert!(matches!(
+            e.get_object("nope", "k", None).await,
+            Err(EngineError::NoSuchBucket)
+        ));
+    }
+
+    #[tokio::test]
+    async fn metadata_persisted() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        let mut opts = PutOpts {
+            content_type: Some("text/plain".into()),
+            ..Default::default()
+        };
+        opts.user_metadata.insert("owner".into(), "khan".into());
+        e.put_object("buk", "k", body(b"v"), opts).await.unwrap();
+        let h = e.head_object("buk", "k").await.unwrap();
+        assert_eq!(h.content_type, "text/plain");
+        assert_eq!(h.user_metadata.get("owner").unwrap(), "khan");
     }
 
     #[tokio::test]
@@ -856,29 +1432,647 @@ mod tests {
         ));
     }
 
-    /// Delete this once Tasks 6 and 7 have replaced the stubs.
+    // --- object cases beyond the brief ---
+
+    fn body_vec(v: Vec<u8>) -> BoxByteStream {
+        futures::stream::iter(vec![Ok(bytes::Bytes::from(v))]).boxed()
+    }
+
+    fn body_chunks(chunks: &[&'static [u8]]) -> BoxByteStream {
+        let items: Vec<_> = chunks
+            .iter()
+            .map(|c| Ok(bytes::Bytes::from_static(c)))
+            .collect();
+        futures::stream::iter(items).boxed()
+    }
+
+    /// The directory holding one key's files, for tests that reach past the
+    /// API to check or corrupt the layout.
+    fn obj_dir(e: &FsEngine, bucket: &str, key: &str) -> PathBuf {
+        FsEngine::object_dir(&e.bucket_dir(bucket), key)
+    }
+
+    #[test]
+    fn range_resolution() {
+        use ByteRange::{From, FromTo, Suffix};
+
+        // No range is the whole object, empty or not.
+        assert_eq!(resolve_range(None, 10).unwrap(), (0, 10));
+        assert_eq!(resolve_range(None, 0).unwrap(), (0, 0));
+
+        // An end past the last byte clamps; that is what makes `bytes=0-` work.
+        assert_eq!(resolve_range(Some(FromTo(0, 9)), 10).unwrap(), (0, 10));
+        assert_eq!(resolve_range(Some(FromTo(0, 100)), 10).unwrap(), (0, 10));
+        assert_eq!(resolve_range(Some(FromTo(9, 9)), 10).unwrap(), (9, 1));
+        assert_eq!(resolve_range(Some(From(0)), 10).unwrap(), (0, 10));
+        assert_eq!(resolve_range(Some(From(9)), 10).unwrap(), (9, 1));
+        assert_eq!(resolve_range(Some(Suffix(1)), 10).unwrap(), (9, 1));
+        assert_eq!(resolve_range(Some(Suffix(10)), 10).unwrap(), (0, 10));
+        assert_eq!(resolve_range(Some(Suffix(99)), 10).unwrap(), (0, 10));
+
+        // A start past the last byte is unsatisfiable, and so is a backwards
+        // range or a zero-length suffix.
+        for bad in [FromTo(10, 12), FromTo(5, 2), From(10), From(99), Suffix(0)] {
+            assert!(
+                matches!(resolve_range(Some(bad), 10), Err(EngineError::InvalidRange)),
+                "{bad:?} should be unsatisfiable"
+            );
+        }
+        // No byte of an empty object is in range, whatever was asked for.
+        for bad in [FromTo(0, 0), From(0), Suffix(1), Suffix(0)] {
+            assert!(
+                matches!(resolve_range(Some(bad), 0), Err(EngineError::InvalidRange)),
+                "{bad:?} should be unsatisfiable on an empty object"
+            );
+        }
+    }
+
+    #[test]
+    fn hex_is_lowercase_and_zero_padded() {
+        assert_eq!(hex_lower(&[0x00, 0x0f, 0xff, 0xa5]), "000fffa5");
+        assert_eq!(hex_lower(&[]), "");
+        // The etag of the empty object, which every S3 client knows by sight.
+        assert_eq!(
+            hex_lower(&Md5::digest(b"")),
+            "d41d8cd98f00b204e9800998ecf8427e"
+        );
+    }
+
     #[tokio::test]
-    async fn the_object_methods_are_not_implemented_yet() {
+    async fn an_empty_object_roundtrips_and_has_no_satisfiable_range() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        let info = e
+            .put_object("buk", "empty", body(b""), PutOpts::default())
+            .await
+            .unwrap();
+        assert_eq!(info.size, 0);
+        assert_eq!(info.etag, "d41d8cd98f00b204e9800998ecf8427e");
+
+        let (gi, off, len, s) = e.get_object("buk", "empty", None).await.unwrap();
+        assert_eq!((gi.size, off, len), (0, 0, 0));
+        assert!(read_all(s).await.is_empty());
+        assert!(matches!(
+            e.get_object("buk", "empty", Some(ByteRange::From(0))).await,
+            Err(EngineError::InvalidRange)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_body_arriving_in_chunks_is_hashed_and_stored_whole() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        let info = e
+            .put_object(
+                "buk",
+                "k",
+                body_chunks(&[b"hello", b"", b" ", b"world"]),
+                PutOpts::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(info.size, 11);
+        assert_eq!(info.etag, "5eb63bbbe01eeed093cb22bb8f5acdc3");
+        let (_, _, _, s) = e.get_object("buk", "k", None).await.unwrap();
+        assert_eq!(read_all(s).await, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn an_object_larger_than_one_read_chunk_streams_whole() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        // Not a multiple of the chunk size, so the last read is a short one.
+        let data: Vec<u8> = (0..READ_CHUNK * 2 + 1234)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let info = e
+            .put_object("buk", "big", body_vec(data.clone()), PutOpts::default())
+            .await
+            .unwrap();
+        assert_eq!(info.size, data.len() as u64);
+        assert_eq!(info.etag, hex_lower(&Md5::digest(&data)));
+
+        let (_, _, len, s) = e.get_object("buk", "big", None).await.unwrap();
+        assert_eq!(len, data.len() as u64);
+        assert_eq!(read_all(s).await, data);
+
+        // A range that starts and ends inside different chunks.
+        let (first, last) = (READ_CHUNK - 5, READ_CHUNK + 5);
+        let (_, off, len, s) = e
+            .get_object(
+                "buk",
+                "big",
+                Some(ByteRange::FromTo(first as u64, last as u64)),
+            )
+            .await
+            .unwrap();
+        assert_eq!((off, len), (first as u64, 11));
+        assert_eq!(read_all(s).await, data[first..=last]);
+    }
+
+    #[tokio::test]
+    async fn put_defaults_the_content_type() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        e.put_object("buk", "silent", body(b"v"), PutOpts::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            e.head_object("buk", "silent").await.unwrap().content_type,
+            "application/octet-stream"
+        );
+
+        // An empty header is no more a content type than a missing one.
+        let opts = PutOpts {
+            content_type: Some(String::new()),
+            ..Default::default()
+        };
+        e.put_object("buk", "blank", body(b"v"), opts)
+            .await
+            .unwrap();
+        assert_eq!(
+            e.head_object("buk", "blank").await.unwrap().content_type,
+            "application/octet-stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn object_calls_report_a_missing_or_invalid_bucket() {
+        let (_d, e) = eng().await;
+        assert!(matches!(
+            e.put_object("absent", "k", body(b"v"), PutOpts::default())
+                .await,
+            Err(EngineError::NoSuchBucket)
+        ));
+        assert!(matches!(
+            e.head_object("absent", "k").await,
+            Err(EngineError::NoSuchBucket)
+        ));
+        assert!(matches!(
+            e.delete_object("absent", "k").await,
+            Err(EngineError::NoSuchBucket)
+        ));
+
+        // A name that would escape buckets/ never reaches the disk at all.
+        for bad in ["../escape", "a/b", "..", ""] {
+            assert!(matches!(
+                e.put_object(bad, "k", body(b"v"), PutOpts::default()).await,
+                Err(EngineError::InvalidBucketName)
+            ));
+            assert!(matches!(
+                e.get_object(bad, "k", None).await,
+                Err(EngineError::InvalidBucketName)
+            ));
+            assert!(matches!(
+                e.head_object(bad, "k").await,
+                Err(EngineError::InvalidBucketName)
+            ));
+            assert!(matches!(
+                e.delete_object(bad, "k").await,
+                Err(EngineError::InvalidBucketName)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unwritten_key_is_absent_and_deleting_it_succeeds() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        assert!(matches!(
+            e.head_object("buk", "never").await,
+            Err(EngineError::NoSuchKey)
+        ));
+        assert!(matches!(
+            e.get_object("buk", "never", None).await,
+            Err(EngineError::NoSuchKey)
+        ));
+        // S3 deletes are idempotent, so this is not an error.
+        e.delete_object("buk", "never").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn keys_the_filesystem_would_choke_on_roundtrip_and_stay_separate() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        let keys = [
+            "",
+            "..",
+            ".",
+            "a/../b",
+            "a//b",
+            "trailing/",
+            META_FILE,
+            "__aks3.v.null.data",
+            "dir/\u{1f600}/emoji",
+            "back\\slash",
+            "pct%25",
+        ];
+        for (i, k) in keys.iter().enumerate() {
+            let value = format!("value-{i}");
+            e.put_object("buk", k, body_vec(value.into_bytes()), PutOpts::default())
+                .await
+                .unwrap();
+        }
+        // Every key must have kept its own bytes: no two encoded to one path.
+        for (i, k) in keys.iter().enumerate() {
+            let (_, _, _, s) = e.get_object("buk", k, None).await.unwrap();
+            assert_eq!(
+                read_all(s).await,
+                format!("value-{i}").into_bytes(),
+                "{k:?}"
+            );
+        }
+        for k in keys {
+            e.delete_object("buk", k).await.unwrap();
+            assert!(
+                matches!(e.head_object("buk", k).await, Err(EngineError::NoSuchKey)),
+                "{k:?}"
+            );
+        }
+        // Every key pruned itself away, so the bucket is empty again.
+        e.delete_bucket("buk").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_on_disk_layout_is_what_the_module_documents() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        e.put_object("buk", "dir/hello.txt", body(b"hi"), PutOpts::default())
+            .await
+            .unwrap();
+
+        let dir = e.bucket_dir("buk").join("objects/dir/hello.txt");
+        assert!(dir.join("__aks3.meta.json").is_file());
+        assert!(dir.join("__aks3.v.null.data").is_file());
+        assert_eq!(
+            std::fs::read(dir.join("__aks3.v.null.data")).unwrap(),
+            b"hi"
+        );
+        // The staging directory is left as it was found.
+        assert_eq!(std::fs::read_dir(e.tmp_dir()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_prunes_its_own_directories_and_leaves_siblings_alone() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        e.put_object("buk", "a/b/c", body(b"c"), PutOpts::default())
+            .await
+            .unwrap();
+        e.put_object("buk", "a/b/d", body(b"d"), PutOpts::default())
+            .await
+            .unwrap();
+
+        e.delete_object("buk", "a/b/c").await.unwrap();
+        assert!(!obj_dir(&e, "buk", "a/b/c").exists());
+        // The shared parent still holds a sibling, so pruning stopped there.
+        assert!(obj_dir(&e, "buk", "a/b/d").is_dir());
+        let (_, _, _, s) = e.get_object("buk", "a/b/d", None).await.unwrap();
+        assert_eq!(read_all(s).await, b"d");
+        assert!(matches!(
+            e.delete_bucket("buk").await,
+            Err(EngineError::BucketNotEmpty)
+        ));
+
+        e.delete_object("buk", "a/b/d").await.unwrap();
+        let objects = e.bucket_dir("buk").join(OBJECTS_DIR);
+        assert!(
+            objects.is_dir(),
+            "objects/ is pruned by nothing but its bucket"
+        );
+        assert!(!has_any_entry(&objects).await.unwrap());
+        e.delete_bucket("buk").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn objects_survive_reopening_the_engine() {
+        let d = tempfile::tempdir().unwrap();
+        let e = FsEngine::open(d.path()).await.unwrap();
+        e.create_bucket("buk").await.unwrap();
+        let put = e
+            .put_object("buk", "dir/k", body(b"durable"), PutOpts::default())
+            .await
+            .unwrap();
+        drop(e);
+
+        let e = FsEngine::open(d.path()).await.unwrap();
+        let head = e.head_object("buk", "dir/k").await.unwrap();
+        assert_eq!((head.size, head.etag), (put.size, put.etag));
+        assert_eq!(head.key, "dir/k");
+        let (_, _, _, s) = e.get_object("buk", "dir/k", None).await.unwrap();
+        assert_eq!(read_all(s).await, b"durable");
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_manifest_is_an_error_not_an_absent_object() {
+        // Reporting NoSuchKey here would present a damaged history as an empty
+        // one and invite the next PUT to overwrite it.
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        e.put_object("buk", "k", body(b"v"), PutOpts::default())
+            .await
+            .unwrap();
+        std::fs::write(obj_dir(&e, "buk", "k").join(META_FILE), b"{ not json").unwrap();
+
+        for err in [
+            e.head_object("buk", "k").await.map(|_| ()),
+            e.get_object("buk", "k", None).await.map(|_| ()),
+        ] {
+            let Err(EngineError::Io(err)) = err else {
+                panic!("expected the parse failure to surface");
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+        // A key whose manifest cannot be parsed must still be deletable.
+        e.delete_object("buk", "k").await.unwrap();
+        assert!(matches!(
+            e.head_object("buk", "k").await,
+            Err(EngineError::NoSuchKey)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_delete_marker_at_the_head_reads_as_absent() {
+        // Phase 0 never writes one, but the manifest format carries them and
+        // reads must already honour them.
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        e.put_object("buk", "k", body(b"v"), PutOpts::default())
+            .await
+            .unwrap();
+
+        let path = obj_dir(&e, "buk", "k").join(META_FILE);
+        let mut manifest = load_manifest(&path).await.unwrap().unwrap();
+        manifest.versions[0].delete_marker = true;
+        store_manifest(&e.tmp_dir(), &path, &manifest)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            e.head_object("buk", "k").await,
+            Err(EngineError::NoSuchKey)
+        ));
+        assert!(matches!(
+            e.get_object("buk", "k", None).await,
+            Err(EngineError::NoSuchKey)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_empty_manifest_reads_as_absent() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        let dir = obj_dir(&e, "buk", "k");
+        store_manifest(&e.tmp_dir(), &dir.join(META_FILE), &new_manifest())
+            .await
+            .unwrap();
+        assert!(matches!(
+            e.head_object("buk", "k").await,
+            Err(EngineError::NoSuchKey)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_data_file_shorter_than_its_manifest_fails_the_read() {
+        // Handing the client a short body under a full Content-Length would be
+        // a silently truncated object.
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        e.put_object("buk", "k", body(b"0123456789"), PutOpts::default())
+            .await
+            .unwrap();
+        std::fs::write(obj_dir(&e, "buk", "k").join("__aks3.v.null.data"), b"012").unwrap();
+
+        let (_, _, len, mut s) = e.get_object("buk", "k", None).await.unwrap();
+        assert_eq!(len, 10);
+        assert_eq!(s.next().await.unwrap().unwrap(), &b"012"[..]);
+        let err = s.next().await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            s.next().await.is_none(),
+            "the stream retried after an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_body_publishes_nothing_and_leaves_no_temp_file() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        let body: BoxByteStream = futures::stream::iter(vec![
+            Ok(bytes::Bytes::from_static(b"partial")),
+            Err(io::Error::other("the client hung up")),
+        ])
+        .boxed();
+
+        assert!(matches!(
+            e.put_object("buk", "k", body, PutOpts::default()).await,
+            Err(EngineError::Io(_))
+        ));
+        assert!(matches!(
+            e.head_object("buk", "k").await,
+            Err(EngineError::NoSuchKey)
+        ));
+        assert!(!obj_dir(&e, "buk", "k").exists());
+        assert_eq!(std::fs::read_dir(e.tmp_dir()).unwrap().count(), 0);
+        // Nothing was published, so the bucket is still empty.
+        e.delete_bucket("buk").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn overwriting_does_not_grow_the_version_history() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        for body_bytes in [&b"one"[..], b"two", b"three"] {
+            e.put_object(
+                "buk",
+                "k",
+                body_vec(body_bytes.to_vec()),
+                PutOpts::default(),
+            )
+            .await
+            .unwrap();
+        }
+        let manifest = load_manifest(&obj_dir(&e, "buk", "k").join(META_FILE))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.versions.len(), 1);
+        assert_eq!(manifest.versions[0].version_id, "null");
+        // One data file, not one per overwrite.
+        let files = std::fs::read_dir(obj_dir(&e, "buk", "k")).unwrap().count();
+        assert_eq!(files, 2, "expected just the manifest and one data file");
+    }
+
+    #[tokio::test]
+    async fn a_put_after_delete_bucket_finds_no_bucket_and_recreates_cleanly() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        e.delete_bucket("buk").await.unwrap();
+
+        // The bucket is gone, so the PUT must not re-create its directory tree
+        // as a side effect of committing into it.
+        assert!(matches!(
+            e.put_object("buk", "k", body(b"v"), PutOpts::default())
+                .await,
+            Err(EngineError::NoSuchBucket)
+        ));
+        assert!(!e.bucket_exists("buk").await.unwrap());
+        assert!(e.list_buckets().await.unwrap().is_empty());
+
+        e.create_bucket("buk").await.unwrap();
+        e.put_object("buk", "k", body(b"v"), PutOpts::default())
+            .await
+            .unwrap();
+        let (_, _, _, s) = e.get_object("buk", "k", None).await.unwrap();
+        assert_eq!(read_all(s).await, b"v");
+        // The recreated bucket has its own meta, not a leftover tree.
+        assert!(e.bucket_dir("buk").join(BUCKET_META_FILE).is_file());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delete_bucket_racing_puts_never_destroys_a_stored_object() {
+        // The check-then-remove in delete_bucket is two steps; the bucket lock
+        // is what stops a PUT from landing between them and being deleted by a
+        // call that had just found the bucket empty.
+        const PUTS: usize = 8;
+
+        let d = tempfile::tempdir().unwrap();
+        let e = Arc::new(FsEngine::open(d.path()).await.unwrap());
+
+        // The delete is started at a different point in the run of PUTs each
+        // round, so the two calls meet in more than one order.
+        for round in 0..=PUTS {
+            let bucket = format!("race-{round}");
+            e.create_bucket(&bucket).await.unwrap();
+
+            let mut puts = Vec::new();
+            let mut deleted = None;
+            for i in 0..=PUTS {
+                if i == round {
+                    let (e, bucket) = (Arc::clone(&e), bucket.clone());
+                    deleted = Some(tokio::spawn(async move { e.delete_bucket(&bucket).await }));
+                }
+                if i == PUTS {
+                    break;
+                }
+                let (e, bucket) = (Arc::clone(&e), bucket.clone());
+                puts.push(tokio::spawn(async move {
+                    e.put_object(&bucket, &format!("k{i}"), body(b"v"), PutOpts::default())
+                        .await
+                        .map(|_| ())
+                }));
+            }
+
+            let puts: Vec<_> = futures::future::join_all(puts)
+                .await
+                .into_iter()
+                .map(|r| r.expect("put task panicked"))
+                .collect();
+            let deleted = deleted.unwrap().await.expect("delete task panicked");
+
+            let stored = puts.iter().filter(|r| r.is_ok()).count();
+            for (i, put) in puts.iter().enumerate() {
+                match put {
+                    // Anything reported as stored must be readable afterwards.
+                    Ok(()) => {
+                        e.head_object(&bucket, &format!("k{i}")).await.unwrap();
+                    }
+                    // The only legal failure is the bucket having gone first.
+                    Err(EngineError::NoSuchBucket) => {}
+                    Err(other) => panic!("round {round}: unexpected put failure: {other:?}"),
+                }
+            }
+            match deleted {
+                // The bucket only goes away empty, so nothing was destroyed.
+                Ok(()) => {
+                    assert_eq!(
+                        stored, 0,
+                        "round {round}: {stored} stored objects destroyed"
+                    );
+                    assert!(!e.bucket_exists(&bucket).await.unwrap());
+                }
+                // Otherwise the objects held the bucket open, which is the point.
+                Err(EngineError::BucketNotEmpty) => {
+                    assert!(stored > 0, "round {round}: bucket held open by nothing");
+                    assert!(e.bucket_exists(&bucket).await.unwrap());
+                }
+                Err(other) => panic!("round {round}: unexpected delete failure: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_puts_to_one_key_leave_exactly_one_whole_version() {
+        let d = tempfile::tempdir().unwrap();
+        let e = Arc::new(FsEngine::open(d.path()).await.unwrap());
+        e.create_bucket("race").await.unwrap();
+
+        // Distinct lengths, so a manifest describing one body and a data file
+        // holding another cannot pass the check below.
+        let bodies: Vec<Vec<u8>> = (1..=8_u8)
+            .map(|n| vec![b'a' + n; usize::from(n) * 3])
+            .collect();
+        let mut puts = Vec::new();
+        for want in bodies.clone() {
+            let e = Arc::clone(&e);
+            puts.push(tokio::spawn(async move {
+                e.put_object("race", "one-key", body_vec(want), PutOpts::default())
+                    .await
+            }));
+        }
+        for put in futures::future::join_all(puts).await {
+            put.expect("put task panicked").expect("put failed");
+        }
+
+        let (info, _, len, s) = e.get_object("race", "one-key", None).await.unwrap();
+        let got = read_all(s).await;
+        assert!(
+            bodies.contains(&got),
+            "the object is not any body that was put"
+        );
+        assert_eq!(info.size, got.len() as u64);
+        assert_eq!(len, got.len() as u64);
+        assert_eq!(info.etag, hex_lower(&Md5::digest(&got)));
+    }
+
+    #[tokio::test]
+    async fn the_lock_tables_do_not_outlive_the_work() {
+        // One entry per key ever written would be a leak the size of the
+        // keyspace; entries go away once nothing holds them.
+        let (_d, e) = eng().await;
+        e.create_bucket("locks").await.unwrap();
+        for i in 0..32 {
+            let key = format!("k{i}");
+            e.put_object("locks", &key, body(b"v"), PutOpts::default())
+                .await
+                .unwrap();
+            e.head_object("locks", &key).await.unwrap();
+            e.delete_object("locks", &key).await.unwrap();
+        }
+        e.delete_bucket("locks").await.unwrap();
+
+        assert!(
+            e.key_locks.is_empty(),
+            "{} key locks left",
+            e.key_locks.len()
+        );
+        assert!(
+            e.bucket_locks.is_empty(),
+            "{} bucket locks left",
+            e.bucket_locks.len()
+        );
+    }
+
+    /// Delete this once Task 7 has replaced the listing stub.
+    #[tokio::test]
+    async fn listing_is_not_implemented_yet() {
         let (_d, e) = eng().await;
         e.create_bucket("photos").await.unwrap();
 
-        let body = futures::stream::empty().boxed();
-        let calls: Vec<Result<(), EngineError>> = vec![
-            e.put_object("photos", "k", body, PutOpts::default())
-                .await
-                .map(|_| ()),
-            e.get_object("photos", "k", None).await.map(|_| ()),
-            e.head_object("photos", "k").await.map(|_| ()),
-            e.delete_object("photos", "k").await,
-            e.list_objects_v2("photos", &ListParams::default())
-                .await
-                .map(|_| ()),
-        ];
-        for call in calls {
-            let Err(EngineError::Io(err)) = call else {
-                panic!("expected an unimplemented error");
-            };
-            assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-        }
+        let Err(EngineError::Io(err)) = e.list_objects_v2("photos", &ListParams::default()).await
+        else {
+            panic!("expected an unimplemented error");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 }
