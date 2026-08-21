@@ -66,10 +66,26 @@ EOF
 "$ROOT/target/release/aks3" --config "$DATA/aks3.toml" > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
+# Something answering on the port is not proof that it is *our* server: a stale
+# aks3 from an interrupted run, or any other local service on this port, would
+# take the connection while the process just built exits on a bind error. A
+# suite that went green against that would be reporting on someone else's
+# binary. So the child has to still be running for a connection to count.
+# shellcheck disable=SC2329  # invoked below and again before pytest
+require_server_alive() {
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    echo "aks3 exited during startup ($1); is 127.0.0.1:$PORT already in use?" >&2
+    echo "--- aks3 server log ---" >&2
+    cat "$SERVER_LOG" >&2
+    exit 1
+  fi
+}
+
 # Readiness is a TCP connect, not a successful request: an unsigned GET / is
 # answered with 403, which is all the proof needed that the server is up.
 ready=""
 for _ in $(seq 1 50); do
+  require_server_alive "while waiting for it to listen"
   if curl -s -o /dev/null "http://127.0.0.1:$PORT"; then
     ready=1
     break
@@ -77,7 +93,7 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 if [ -z "$ready" ]; then
-  echo "aks3 did not start listening on 127.0.0.1:$PORT; server log follows" >&2
+  echo "aks3 did not start listening on 127.0.0.1:$PORT within 10s; log follows" >&2
   cat "$SERVER_LOG" >&2
   exit 1
 fi
@@ -117,6 +133,12 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -q -r requirements.txt
 pip install -q -e .
+
+# The check in the readiness loop can race a server that is still on its way
+# out: it answers one connection, then exits on a bind error. This one cannot,
+# because the clone and the pip install stand between the two, and it doubles
+# as a guard against the server having died during setup.
+require_server_alive "before running the suite"
 
 status=0
 S3TEST_CONF="$DATA/s3tests.conf" python -m pytest -q --no-header -p no:cacheprovider "${nodes[@]}" || status=$?
