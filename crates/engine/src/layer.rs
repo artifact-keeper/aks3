@@ -152,8 +152,9 @@ pub trait ObjectLayer: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// [`EngineError::NoSuchBucket`], or [`EngineError::Io`] including any
-    /// error the body stream itself yields.
+    /// [`EngineError::NoSuchBucket`], [`EngineError::KeyTooLong`] if the key
+    /// does not fit the filesystem's name limit, or [`EngineError::Io`]
+    /// including any error the body stream itself yields.
     async fn put_object(
         &self,
         bucket: &str,
@@ -170,8 +171,9 @@ pub trait ObjectLayer: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// [`EngineError::NoSuchBucket`], [`EngineError::NoSuchKey`], or
-    /// [`EngineError::InvalidRange`] if `range` does not overlap the object.
+    /// [`EngineError::NoSuchBucket`], [`EngineError::NoSuchKey`],
+    /// [`EngineError::KeyTooLong`], or [`EngineError::InvalidRange`] if `range`
+    /// does not overlap the object.
     async fn get_object(
         &self,
         bucket: &str,
@@ -183,16 +185,20 @@ pub trait ObjectLayer: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// [`EngineError::NoSuchBucket`] or [`EngineError::NoSuchKey`].
+    /// [`EngineError::NoSuchBucket`], [`EngineError::NoSuchKey`], or
+    /// [`EngineError::KeyTooLong`].
     async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectInfo, EngineError>;
 
     /// Delete `key`.
     ///
-    /// Deleting a key that is not there succeeds, as it does in S3.
+    /// Deleting a key that is not there succeeds, as it does in S3. A key that
+    /// could never have been stored is the exception: see
+    /// [`EngineError::KeyTooLong`].
     ///
     /// # Errors
     ///
-    /// [`EngineError::NoSuchBucket`], or [`EngineError::Io`].
+    /// [`EngineError::NoSuchBucket`], [`EngineError::KeyTooLong`], or
+    /// [`EngineError::Io`].
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), EngineError>;
 
     /// One page of the bucket's keys.

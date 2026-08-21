@@ -128,3 +128,8 @@ The same operations driven from the AWS SDK for Rust are what
   for APFS volumes, that makes `photo.jpg` and `Photo.JPG` one object where S3
   has two. Use a case-sensitive volume for anything that matters. Linux
   filesystems are already case-sensitive.
+- Because keys become paths, a key whose components are longer than the
+  filesystem's name limit (255 bytes on APFS and ext4) cannot be stored. S3
+  allows any key up to 1024 bytes, so such a key is legal and aks3 rejects it,
+  with `KeyTooLongError` and a 400 from every operation on it. Nesting the key
+  with `/` separators keeps each component under the limit.

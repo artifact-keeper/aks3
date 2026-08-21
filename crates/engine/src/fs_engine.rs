@@ -1189,6 +1189,53 @@ mod tests {
         ));
     }
 
+    /// A key component longer than the filesystem's name limit is a legal S3
+    /// key that this engine cannot store, and it has to fail as a client error
+    /// rather than as an I/O fault the API layer would report as a 500 and a
+    /// client would retry forever.
+    ///
+    /// Every verb is checked, not just the `PUT`: they build the same path from
+    /// the same key, and a `GET` answering `NoSuchKey` would tell a client the
+    /// key is merely empty right after the `PUT` said it was unusable.
+    #[tokio::test]
+    async fn a_key_component_over_the_name_limit_is_a_client_error() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        let key = "n".repeat(300);
+        assert!(matches!(
+            e.put_object("buk", &key, body(b"v"), PutOpts::default())
+                .await,
+            Err(EngineError::KeyTooLong)
+        ));
+        assert!(matches!(
+            e.get_object("buk", &key, None).await,
+            Err(EngineError::KeyTooLong)
+        ));
+        assert!(matches!(
+            e.head_object("buk", &key).await,
+            Err(EngineError::KeyTooLong)
+        ));
+        assert!(matches!(
+            e.delete_object("buk", &key).await,
+            Err(EngineError::KeyTooLong)
+        ));
+    }
+
+    /// The other side of the limit: a component right at `NAME_MAX` is stored
+    /// and read back, so the rejection above is the filesystem's boundary and
+    /// not a rule aks3 applies too early.
+    #[tokio::test]
+    async fn a_key_component_at_the_name_limit_still_works() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        let key = "n".repeat(255);
+        e.put_object("buk", &key, body(b"v"), PutOpts::default())
+            .await
+            .unwrap();
+        let (_, _, _, s) = e.get_object("buk", &key, None).await.unwrap();
+        assert_eq!(read_all(s).await, b"v");
+    }
+
     #[tokio::test]
     async fn metadata_persisted() {
         let (_d, e) = eng().await;

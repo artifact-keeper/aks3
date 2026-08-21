@@ -5,13 +5,13 @@
 
 //! Engine failures as S3 wire errors.
 //!
-//! The engine speaks in [`EngineError`], which has seven variants and no
+//! The engine speaks in [`EngineError`], which has eight variants and no
 //! knowledge of HTTP; the wire wants an S3 error code. [`map_engine_err`] is the
 //! single place that translation happens, so a handler never invents a code and
 //! the same engine condition always reaches a client as the same code.
 //!
-//! Six of the seven variants describe something the client did, and map
-//! straight across. The seventh, [`EngineError::Io`], describes something that
+//! Seven of the eight variants describe something about the request, and map
+//! straight across. The eighth, [`EngineError::Io`], describes something that
 //! went wrong on our side: its message routinely carries a host path
 //! (`/var/lib/aks3/...`), so it becomes a bare `InternalError` and the detail
 //! goes to the log instead of the response body.
@@ -32,6 +32,9 @@ pub fn map_engine_err(err: EngineError) -> S3Error {
         EngineError::InvalidBucketName => s3_error!(InvalidBucketName),
         EngineError::NoSuchKey => s3_error!(NoSuchKey),
         EngineError::InvalidRange => s3_error!(InvalidRange),
+        // A 400, not a 500: the key is longer than aks3 can store, and the
+        // client is the only side that can do anything about that.
+        EngineError::KeyTooLong => s3_error!(KeyTooLongError),
         EngineError::Io(io) => {
             tracing::error!(error = %io, "engine i/o failure");
             s3_error!(InternalError)
@@ -82,7 +85,7 @@ mod tests {
         );
     }
 
-    /// The remaining three client-visible variants, so all seven are pinned.
+    /// The remaining four client-visible variants, so all eight are pinned.
     #[test]
     fn every_variant_maps() {
         assert_eq!(
@@ -97,6 +100,10 @@ mod tests {
             *map_engine_err(EngineError::InvalidBucketName).code(),
             S3ErrorCode::InvalidBucketName
         );
+        assert_eq!(
+            *map_engine_err(EngineError::KeyTooLong).code(),
+            S3ErrorCode::KeyTooLongError
+        );
     }
 
     /// A client-visible code must not be reported as a server fault: every
@@ -110,6 +117,7 @@ mod tests {
             EngineError::InvalidBucketName,
             EngineError::NoSuchKey,
             EngineError::InvalidRange,
+            EngineError::KeyTooLong,
         ] {
             let mapped = map_engine_err(err);
             let status = mapped.status_code().expect("mapped code has a status");

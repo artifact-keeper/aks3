@@ -906,6 +906,31 @@ mod tests {
         assert_eq!(*err.code(), S3ErrorCode::NoSuchBucket);
     }
 
+    /// A key too long for the filesystem underneath is a 400 with a code that
+    /// names the problem, not a 500 the client would keep retrying. The `GET`
+    /// is checked alongside it because answering that one with `NoSuchKey`
+    /// would contradict the `PUT` that just refused the same key.
+    #[tokio::test]
+    async fn a_key_over_the_filesystem_name_limit_is_key_too_long() {
+        let (_dir, s) = svc().await;
+        s.create_bucket(create("buk")).await.expect("create");
+
+        let key = "n".repeat(300);
+        let err = s
+            .put_object(put(&key, b"x"))
+            .await
+            .expect_err("300-byte key component");
+        assert_eq!(*err.code(), S3ErrorCode::KeyTooLongError);
+        assert!(
+            err.status_code().expect("a status").is_client_error(),
+            "{:?}",
+            err.status_code()
+        );
+
+        let err = s.get_object(get(&key)).await.expect_err("same key");
+        assert_eq!(*err.code(), S3ErrorCode::KeyTooLongError);
+    }
+
     /// `s3s` hands the handler an optional body, so a `PUT` can arrive with
     /// none. That is a malformed request, not an empty object.
     #[tokio::test]
