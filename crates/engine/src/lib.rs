@@ -4,3 +4,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Placeholder crate root for Phase 0 scaffolding.
+
+pub mod paths;
