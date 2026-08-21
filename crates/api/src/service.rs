@@ -13,8 +13,8 @@
 //!
 //! Every method in [`S3`](s3s::S3) has a default body that returns
 //! `NotImplemented`, so only the operations implemented here are answered; the
-//! rest are rejected until they are filled in. The bucket and object operations
-//! are in place; listing and the multipart family are not.
+//! rest are rejected until they are filled in. The bucket and object
+//! operations are in place, as is `ListObjectsV2`; the multipart family is not.
 //!
 //! A handler does three things and nothing else: unwrap the input, call the
 //! engine, and shape the answer. It never decides what an error means (that is
@@ -33,14 +33,15 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aks3_engine::{BoxByteStream, ByteRange, ObjectInfo, ObjectLayer, PutOpts};
+use aks3_engine::{BoxByteStream, ByteRange, ListParams, ObjectInfo, ObjectLayer, PutOpts};
 use futures::{Stream, StreamExt as _, TryStreamExt as _};
 use s3s::dto::{
-    Bucket, ContentLength, CreateBucketInput, CreateBucketOutput, DeleteBucketInput,
+    Bucket, CommonPrefix, ContentLength, CreateBucketInput, CreateBucketOutput, DeleteBucketInput,
     DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput, ETag, GetObjectInput,
     GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput,
-    ListBucketsInput, ListBucketsOutput, Owner, PutObjectInput, PutObjectOutput, Range as DtoRange,
-    StreamingBlob, Timestamp,
+    KeyCount, ListBucketsInput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output,
+    MaxKeys, Object, Owner, PutObjectInput, PutObjectOutput, Range as DtoRange, StreamingBlob,
+    Timestamp,
 };
 use s3s::{s3_error, S3Request, S3Response, S3Result};
 
@@ -113,6 +114,22 @@ fn to_byte_range(range: &DtoRange) -> ByteRange {
 fn content_range(offset: u64, len: u64, size: u64) -> String {
     let last = offset.saturating_add(len).saturating_sub(1);
     format!("bytes {offset}-{last}/{size}")
+}
+
+/// The most keys one page of a listing carries, which is also the number S3
+/// uses when the client names none.
+const MAX_KEYS_PER_PAGE: MaxKeys = 1000;
+
+/// The page budget a listing request asks for, made usable.
+///
+/// An absent `max-keys` is S3's default, and a larger one is capped: the number
+/// decides how much of a bucket a single request makes the engine hold, so it
+/// is not the client's to raise. A negative number is not a legal request and
+/// becomes a request for nothing, which the engine answers with an empty page.
+fn page_size(requested: Option<MaxKeys>) -> MaxKeys {
+    requested
+        .unwrap_or(MAX_KEYS_PER_PAGE)
+        .clamp(0, MAX_KEYS_PER_PAGE)
 }
 
 /// A byte count as the wire's signed one.
@@ -343,16 +360,95 @@ impl<L: ObjectLayer> s3s::S3 for Aks3<L> {
             .map_err(map_engine_err)?;
         Ok(S3Response::new(DeleteObjectOutput::default()))
     }
+
+    /// One page of the bucket's keys, in ascending order.
+    ///
+    /// The request is repeated back beside the page. S3 clients match a
+    /// response to the query that produced it, and a paging client sends the
+    /// prefix and delimiter it was given back on the next request, so a listing
+    /// that dropped them would have the client paging over a different query
+    /// than it started.
+    ///
+    /// The count reported is objects plus common prefixes, not objects alone:
+    /// a folded prefix fills a slot of the budget in the engine, and reporting
+    /// only the objects would let the count exceed the `max-keys` that produced
+    /// it, which is the one thing S3 promises about it.
+    async fn list_objects_v2(
+        &self,
+        req: S3Request<ListObjectsV2Input>,
+    ) -> S3Result<S3Response<ListObjectsV2Output>> {
+        let input = req.input;
+        let max_keys = page_size(input.max_keys);
+        // The query moves into the params and is echoed back out of them
+        // afterwards, so nothing here is cloned to be said twice.
+        let params = ListParams {
+            prefix: input.prefix,
+            delimiter: input.delimiter,
+            continuation_token: input.continuation_token,
+            start_after: input.start_after,
+            // Non-negative after the clamp, so the fallback never runs.
+            max_keys: usize::try_from(max_keys).unwrap_or(0),
+        };
+
+        let page = self
+            .engine
+            .list_objects_v2(&input.bucket, &params)
+            .await
+            .map_err(map_engine_err)?;
+
+        let contents: Vec<Object> = page
+            .objects
+            .into_iter()
+            .map(|o| Object {
+                key: Some(o.key),
+                size: Some(wire_length(o.size)),
+                // Bare, as everywhere else: `s3s` writes the quotes S3 spells
+                // an etag with when it renders the listing.
+                e_tag: Some(ETag::Strong(o.etag)),
+                last_modified: Some(Timestamp::from(epoch_ms_to_systemtime(o.mtime_epoch_ms))),
+                ..Default::default()
+            })
+            .collect();
+        let common_prefixes: Vec<CommonPrefix> = page
+            .common_prefixes
+            .into_iter()
+            .map(|prefix| CommonPrefix {
+                prefix: Some(prefix),
+            })
+            .collect();
+        // Bounded by the budget, which is bounded by MAX_KEYS_PER_PAGE, so the
+        // fallback never runs; it is here so the conversion is total.
+        let key_count =
+            KeyCount::try_from(contents.len() + common_prefixes.len()).unwrap_or(MAX_KEYS_PER_PAGE);
+
+        Ok(S3Response::new(ListObjectsV2Output {
+            name: Some(input.bucket),
+            prefix: params.prefix,
+            delimiter: params.delimiter,
+            max_keys: Some(max_keys),
+            key_count: Some(key_count),
+            continuation_token: params.continuation_token,
+            start_after: params.start_after,
+            is_truncated: Some(page.is_truncated),
+            next_continuation_token: page.next_continuation_token,
+            // Both lists are always present, empty when nothing matched: an
+            // absent list and an empty one mean the same thing here, and only
+            // one of them makes a client handle two cases.
+            contents: Some(contents),
+            common_prefixes: Some(common_prefixes),
+            ..Default::default()
+        }))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{epoch_ms_to_systemtime, Aks3};
+    use super::{epoch_ms_to_systemtime, page_size, Aks3};
     use aks3_engine::FsEngine;
     use s3s::dto::{
         CreateBucketInput, DeleteBucketInput, DeleteObjectInput, ETag, GetObjectInput,
-        HeadBucketInput, HeadObjectInput, ListBucketsInput, Metadata, PutObjectInput, Range,
-        StreamingBlob, Timestamp,
+        HeadBucketInput, HeadObjectInput, ListBucketsInput, ListObjectsV2Input,
+        ListObjectsV2Output, Metadata, PutObjectInput, Range, StreamingBlob, Timestamp,
     };
     use s3s::{S3ErrorCode, S3Request, S3};
     use std::sync::Arc;
@@ -452,6 +548,44 @@ mod tests {
             key: key.to_owned(),
             ..Default::default()
         })
+    }
+
+    /// A `ListObjectsV2` over `buk`, with `params` supplying everything else.
+    fn list(params: ListObjectsV2Input) -> S3Request<ListObjectsV2Input> {
+        req(ListObjectsV2Input {
+            bucket: "buk".to_owned(),
+            ..params
+        })
+    }
+
+    /// A bucket named `buk` holding a one-byte object at each of `keys`.
+    async fn seeded(keys: &[&str]) -> (tempfile::TempDir, Aks3<FsEngine>) {
+        let (dir, s) = svc().await;
+        s.create_bucket(create("buk")).await.expect("create");
+        for key in keys {
+            s.put_object(put(key, b"1")).await.expect("put");
+        }
+        (dir, s)
+    }
+
+    /// The keys a listing reported, in the order it reported them.
+    fn keys_of(out: &ListObjectsV2Output) -> Vec<String> {
+        out.contents
+            .as_ref()
+            .expect("contents")
+            .iter()
+            .map(|o| o.key.clone().expect("key"))
+            .collect()
+    }
+
+    /// The common prefixes a listing reported, in order.
+    fn prefixes_of(out: &ListObjectsV2Output) -> Vec<String> {
+        out.common_prefixes
+            .as_ref()
+            .expect("common prefixes")
+            .iter()
+            .map(|p| p.prefix.clone().expect("prefix"))
+            .collect()
     }
 
     /// The etag of `hello world`, as the engine spells it: bare lowercase hex.
@@ -976,5 +1110,277 @@ mod tests {
             .expect("list")
             .output;
         assert_eq!(out.buckets.expect("buckets").len(), 0);
+    }
+
+    /// The budget a request turns into: S3's default when it names none, the
+    /// number it named when that is usable, and nothing outside the range the
+    /// engine will be asked for.
+    #[test]
+    fn the_page_budget_defaults_and_clamps() {
+        assert_eq!(page_size(None), 1000);
+        assert_eq!(page_size(Some(7)), 7);
+        assert_eq!(page_size(Some(0)), 0);
+        assert_eq!(page_size(Some(1000)), 1000);
+        assert_eq!(page_size(Some(5_000)), 1000);
+        assert_eq!(page_size(Some(i32::MAX)), 1000);
+        assert_eq!(page_size(Some(-1)), 0);
+        assert_eq!(page_size(Some(i32::MIN)), 0);
+    }
+
+    /// A delimited listing over the trait: a top-level key is reported as
+    /// itself, and everything below a folder collapses into one prefix.
+    #[tokio::test]
+    async fn list_v2_via_s3_trait() {
+        let (_dir, s) = seeded(&["a", "d/x", "d/y"]).await;
+
+        let out = s
+            .list_objects_v2(list(ListObjectsV2Input {
+                delimiter: Some("/".to_owned()),
+                ..Default::default()
+            }))
+            .await
+            .expect("list")
+            .output;
+
+        assert_eq!(keys_of(&out), ["a"]);
+        assert_eq!(prefixes_of(&out), ["d/"]);
+    }
+
+    /// Every listed object carries what a client indexes on: its key, its
+    /// size, its etag and when it last changed.
+    #[tokio::test]
+    async fn a_listed_object_carries_size_etag_and_time() {
+        let (_dir, s) = svc().await;
+        s.create_bucket(create("buk")).await.expect("create");
+        s.put_object(put("k", b"hello world")).await.expect("put");
+
+        let out = s
+            .list_objects_v2(list(ListObjectsV2Input::default()))
+            .await
+            .expect("list")
+            .output;
+
+        let contents = out.contents.expect("contents");
+        let object = contents.first().expect("one object");
+        assert_eq!(object.key.as_deref(), Some("k"));
+        assert_eq!(object.size, Some(11));
+        assert_eq!(object.e_tag, Some(hello_world_etag()));
+        assert!(
+            object.last_modified.clone().expect("last modified")
+                > Timestamp::from(std::time::UNIX_EPOCH)
+        );
+    }
+
+    /// The response repeats the request back: clients match a page to the
+    /// query that produced it by the echoed prefix, delimiter and budget, and
+    /// read the bucket's name off the listing itself.
+    #[tokio::test]
+    async fn a_listing_echoes_the_request_back() {
+        let (_dir, s) = seeded(&["d/x"]).await;
+
+        let out = s
+            .list_objects_v2(list(ListObjectsV2Input {
+                prefix: Some("d/".to_owned()),
+                delimiter: Some("/".to_owned()),
+                max_keys: Some(7),
+                start_after: Some("d/".to_owned()),
+                ..Default::default()
+            }))
+            .await
+            .expect("list")
+            .output;
+
+        assert_eq!(out.name.as_deref(), Some("buk"));
+        assert_eq!(out.prefix.as_deref(), Some("d/"));
+        assert_eq!(out.delimiter.as_deref(), Some("/"));
+        assert_eq!(out.max_keys, Some(7));
+        assert_eq!(out.start_after.as_deref(), Some("d/"));
+        assert_eq!(keys_of(&out), ["d/x"]);
+    }
+
+    /// A request that names no budget gets S3's default of 1000, and the page
+    /// says so rather than leaving the client to assume it.
+    #[tokio::test]
+    async fn an_unbounded_request_defaults_to_a_thousand_keys() {
+        let (_dir, s) = seeded(&["a"]).await;
+
+        let out = s
+            .list_objects_v2(list(ListObjectsV2Input::default()))
+            .await
+            .expect("list")
+            .output;
+
+        assert_eq!(out.max_keys, Some(1000));
+    }
+
+    /// A budget larger than the ceiling is capped at it: how much work one
+    /// request makes the engine do is not the client's to raise.
+    #[tokio::test]
+    async fn an_oversized_budget_is_capped_at_a_thousand() {
+        let (_dir, s) = seeded(&["a"]).await;
+
+        let out = s
+            .list_objects_v2(list(ListObjectsV2Input {
+                max_keys: Some(5_000),
+                ..Default::default()
+            }))
+            .await
+            .expect("list")
+            .output;
+
+        assert_eq!(out.max_keys, Some(1000));
+        assert_eq!(keys_of(&out), ["a"]);
+    }
+
+    /// A budget of zero is a legal request for nothing: an empty page that is
+    /// not truncated, since nothing was left out that a token could resume.
+    #[tokio::test]
+    async fn a_budget_of_zero_lists_nothing_and_is_not_truncated() {
+        let (_dir, s) = seeded(&["a", "b"]).await;
+
+        let out = s
+            .list_objects_v2(list(ListObjectsV2Input {
+                max_keys: Some(0),
+                ..Default::default()
+            }))
+            .await
+            .expect("list")
+            .output;
+
+        assert!(keys_of(&out).is_empty());
+        assert_eq!(out.key_count, Some(0));
+        assert_eq!(out.is_truncated, Some(false));
+        assert!(out.next_continuation_token.is_none());
+    }
+
+    /// A negative budget is not a legal request, and it reaches the engine as
+    /// an empty page rather than as a conversion that blows up on the way.
+    #[tokio::test]
+    async fn a_negative_budget_lists_nothing() {
+        let (_dir, s) = seeded(&["a"]).await;
+
+        let out = s
+            .list_objects_v2(list(ListObjectsV2Input {
+                max_keys: Some(-1),
+                ..Default::default()
+            }))
+            .await
+            .expect("list")
+            .output;
+
+        assert!(keys_of(&out).is_empty());
+        assert_eq!(out.max_keys, Some(0));
+    }
+
+    /// The token a truncated page hands back resumes the listing where it
+    /// stopped: the pages together are the bucket, in order, once each.
+    #[tokio::test]
+    async fn the_continuation_token_resumes_the_listing() {
+        let (_dir, s) = seeded(&["a", "b", "c"]).await;
+
+        let first = s
+            .list_objects_v2(list(ListObjectsV2Input {
+                max_keys: Some(2),
+                ..Default::default()
+            }))
+            .await
+            .expect("list")
+            .output;
+        assert_eq!(keys_of(&first), ["a", "b"]);
+        assert_eq!(first.is_truncated, Some(true));
+        let token = first.next_continuation_token.expect("a token");
+
+        let second = s
+            .list_objects_v2(list(ListObjectsV2Input {
+                max_keys: Some(2),
+                continuation_token: Some(token.clone()),
+                ..Default::default()
+            }))
+            .await
+            .expect("list")
+            .output;
+        assert_eq!(keys_of(&second), ["c"]);
+        assert_eq!(second.is_truncated, Some(false));
+        assert!(second.next_continuation_token.is_none());
+        assert_eq!(second.continuation_token.as_deref(), Some(token.as_str()));
+    }
+
+    /// A folded prefix is a key as far as the count is concerned, which is
+    /// what keeps the count from exceeding the budget that produced it.
+    #[tokio::test]
+    async fn key_count_counts_objects_and_folded_prefixes_together() {
+        let (_dir, s) = seeded(&["a", "d/x", "d/y", "e/z"]).await;
+
+        let out = s
+            .list_objects_v2(list(ListObjectsV2Input {
+                delimiter: Some("/".to_owned()),
+                ..Default::default()
+            }))
+            .await
+            .expect("list")
+            .output;
+        assert_eq!(keys_of(&out), ["a"]);
+        assert_eq!(prefixes_of(&out), ["d/", "e/"]);
+        assert_eq!(out.key_count, Some(3));
+
+        let page = s
+            .list_objects_v2(list(ListObjectsV2Input {
+                delimiter: Some("/".to_owned()),
+                max_keys: Some(2),
+                ..Default::default()
+            }))
+            .await
+            .expect("list")
+            .output;
+        assert_eq!(page.key_count, Some(2));
+        assert_eq!(page.is_truncated, Some(true));
+    }
+
+    /// `start_after` reaches the engine: the page begins strictly past the key
+    /// it names.
+    #[tokio::test]
+    async fn start_after_begins_the_page_past_that_key() {
+        let (_dir, s) = seeded(&["a", "b", "c"]).await;
+
+        let out = s
+            .list_objects_v2(list(ListObjectsV2Input {
+                start_after: Some("a".to_owned()),
+                ..Default::default()
+            }))
+            .await
+            .expect("list")
+            .output;
+
+        assert_eq!(keys_of(&out), ["b", "c"]);
+    }
+
+    /// An empty bucket lists an empty page: both lists are present and empty
+    /// rather than left out, so a client need not treat absence as a case.
+    #[tokio::test]
+    async fn an_empty_bucket_lists_empty_contents_and_prefixes() {
+        let (_dir, s) = seeded(&[]).await;
+
+        let out = s
+            .list_objects_v2(list(ListObjectsV2Input::default()))
+            .await
+            .expect("list")
+            .output;
+
+        assert!(keys_of(&out).is_empty());
+        assert!(prefixes_of(&out).is_empty());
+        assert_eq!(out.key_count, Some(0));
+        assert_eq!(out.is_truncated, Some(false));
+    }
+
+    /// Listing a bucket that does not exist is `NoSuchBucket`, the engine's
+    /// verdict passed through rather than an empty listing.
+    #[tokio::test]
+    async fn listing_a_missing_bucket_is_no_such_bucket() {
+        let (_dir, s) = svc().await;
+        let err = s
+            .list_objects_v2(list(ListObjectsV2Input::default()))
+            .await
+            .expect_err("missing bucket");
+        assert_eq!(*err.code(), S3ErrorCode::NoSuchBucket);
     }
 }
