@@ -1,0 +1,68 @@
+# Template for the ceph/s3-tests config, with @PORT@ substituted by
+# run-s3-tests.sh so the port lives in exactly one place.
+#
+# s3-tests' configure() insists on every section below being present, even for
+# a run that touches none of the identities they describe: a missing [iam root]
+# section aborts collection before a single test runs. Phase 0 aks3 has one
+# identity, the root credential, so every section carries the same key pair.
+# Tests that check one user cannot see another user's buckets would therefore
+# pass or fail for the wrong reason, and are deliberately kept off the
+# allowlist until aks3 has real users.
+
+[DEFAULT]
+host = 127.0.0.1
+port = @PORT@
+is_secure = False
+ssl_verify = False
+
+[fixtures]
+# Padded out to 30 characters with random filler by s3-tests. Bucket names are
+# therefore always well past the 3-character minimum aks3 enforces.
+bucket prefix = aks3-{random}-
+iam name prefix = s3-tests-
+iam path prefix = /s3-tests/
+
+[s3 main]
+display_name = aks3 root
+user_id = aks3-root
+email = root@aks3.invalid
+api_name = us-east-1
+access_key = s3testsroot
+secret_key = s3testsrootsecret
+
+# Same credential as [s3 main]: see the note at the top of this file.
+[s3 alt]
+display_name = aks3 root
+user_id = aks3-root
+email = root@aks3.invalid
+access_key = s3testsroot
+secret_key = s3testsrootsecret
+
+[s3 tenant]
+display_name = aks3 root
+user_id = aks3-root
+email = root@aks3.invalid
+tenant = aks3
+access_key = s3testsroot
+secret_key = s3testsrootsecret
+
+[iam]
+display_name = aks3 root
+user_id = aks3-root
+email = root@aks3.invalid
+access_key = s3testsroot
+secret_key = s3testsrootsecret
+
+[iam root]
+account_id = aks3-root
+user_id = aks3-root
+email = root@aks3.invalid
+access_key = s3testsroot
+secret_key = s3testsrootsecret
+
+[iam alt root]
+account_id = aks3-root
+user_id = aks3-root
+email = root@aks3.invalid
+access_key = s3testsroot
+secret_key = s3testsrootsecret

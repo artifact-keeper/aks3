@@ -1,0 +1,60 @@
+# Tests listed here MUST pass in CI. Growing this list is the compliance
+# roadmap; shrinking it requires a tracked issue.
+#
+# Node IDs are written against the ceph/s3-tests revision pinned as
+# S3_TESTS_REF in run-s3-tests.sh. Bump the pin and the IDs together.
+#
+# What limits this list today is not the API surface but s3-tests' own
+# teardown. Its autouse setup_teardown fixture calls nuke_prefixed_buckets on
+# every test, which walks each leftover bucket with ListObjectVersions and
+# empties it with DeleteObjects. aks3 implements neither, so a test that leaves
+# a bucket behind errors in teardown no matter what the test itself did. Every
+# entry below is therefore a test that ends with no bucket of its own: the
+# happy-path object and listing tests are blocked on those two operations, not
+# on the behaviour they check.
+#
+# Landing ListObjectVersions (an unversioned store answers with one version per
+# key, "null") and DeleteObjects unblocks the bulk of the core suite in one go,
+# and is the first thing Phase 1 should do to this file.
+
+# --- Bucket lifecycle -------------------------------------------------------
+s3tests/functional/test_s3.py::test_bucket_create_delete
+s3tests/functional/test_s3.py::test_bucket_delete_notexist
+s3tests/functional/test_s3.py::test_bucket_head_notexist
+
+# --- Bucket name validation -------------------------------------------------
+s3tests/functional/test_s3.py::test_bucket_create_naming_bad_short_one
+s3tests/functional/test_s3.py::test_bucket_create_naming_bad_short_two
+s3tests/functional/test_s3.py::test_bucket_create_naming_bad_starts_nonalpha
+s3tests/functional/test_s3.py::test_bucket_create_naming_bad_ip
+s3tests/functional/test_s3.py::test_bucket_create_naming_dns_underscore
+s3tests/functional/test_s3.py::test_bucket_create_naming_dns_dash_at_end
+s3tests/functional/test_s3.py::test_bucket_create_naming_dns_dot_dot
+s3tests/functional/test_s3.py::test_bucket_create_naming_dns_dot_dash
+s3tests/functional/test_s3.py::test_bucket_create_naming_dns_dash_dot
+
+# --- Listing and object errors on a bucket that is not there ----------------
+s3tests/functional/test_s3.py::test_bucketv2_notexist
+s3tests/functional/test_s3.py::test_object_write_to_nonexist_bucket
+
+# --- SigV4 rejection paths --------------------------------------------------
+s3tests/functional/test_s3.py::test_list_buckets_invalid_auth
+s3tests/functional/test_s3.py::test_list_buckets_bad_auth
+
+# --- Request header validation ----------------------------------------------
+s3tests/functional/test_headers.py::test_bucket_create_bad_contentlength_empty
+s3tests/functional/test_headers.py::test_bucket_create_bad_contentlength_negative
+
+# --- Seeded but not yet passing ---------------------------------------------
+# Kept here as the burn-down list. Each names the aks3 gap that blocks it; none
+# is a test-name problem.
+#
+# test_bucket_list_empty                  ListObjects (v1) unimplemented, and
+# test_bucket_list_distinct               leaves a bucket for the teardown gap
+# test_bucket_list_delimiter_basic        ListObjects (v1) unimplemented
+# test_bucket_list_prefix_basic           ListObjects (v1) unimplemented
+# test_bucket_notexist                    ListObjects (v1): 501, want 404
+#                                         NoSuchBucket (test_bucketv2_notexist
+#                                         is the v2 twin and is allowlisted)
+# test_object_write_read_update_read_delete  passes on its own; blocked only by
+# test_object_read_not_exist                 the ListObjectVersions teardown

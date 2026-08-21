@@ -14,3 +14,16 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # Runs the allowlisted subset of ceph/s3-tests against a real aks3 process.
+  # The allowlist is the gate: a change that breaks one of those behaviours
+  # fails here rather than in whatever client hits it first.
+  compliance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: tests/compliance/run-s3-tests.sh

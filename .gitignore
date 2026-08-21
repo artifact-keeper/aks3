@@ -1,3 +1,4 @@
 /target
 *.pem
 .DS_Store
+/tests/compliance/s3-tests/
