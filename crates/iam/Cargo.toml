@@ -1,0 +1,13 @@
+[package]
+name = "aks3-iam"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+s3s = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

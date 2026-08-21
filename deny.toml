@@ -1,0 +1,14 @@
+[licenses]
+# AGPL-3.0-only covers the aks3 workspace crates themselves. Everything else in
+# the list is the permissive-dependency policy.
+allow = ["AGPL-3.0-only", "Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "OpenSSL", "Zlib", "CDLA-Permissive-2.0"]
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # rustls-pemfile is unmaintained: it is now a thin wrapper over the PEM
+    # parsing in rustls-pki-types, with no vulnerability and no safe upgrade.
+    # The workspace pins it for TLS key loading in the server crate; migrate to
+    # rustls_pki_types::pem::PemObject and drop this entry.
+    { id = "RUSTSEC-2025-0134", reason = "no vulnerability; superseded by rustls-pki-types PemObject, migration tracked separately" },
+]
