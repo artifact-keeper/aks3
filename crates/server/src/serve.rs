@@ -37,6 +37,18 @@ use crate::config::{Config, TlsConfig};
 /// is generous enough to let one finish rather than tuned for a fast exit.
 const GRACE_PERIOD: Duration = Duration::from_secs(10);
 
+/// How long the accept loop waits after a failed `accept` before trying again.
+///
+/// Most accept failures are one connection's problem and the next call
+/// succeeds, but some are not: out of file descriptors, or out of memory for
+/// the socket, and those persist until an operator or a closing connection
+/// fixes them. Retrying immediately turns such a condition into a loop spinning
+/// at the speed of the syscall, burning a core and filling the log with the
+/// same line, which is the state least likely to leave room for the connections
+/// already open to finish and free what is exhausted. The pause is short enough
+/// that a transient failure costs one client nothing it would notice.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
 /// The protocols offered during a TLS handshake, best first.
 const ALPN_PROTOCOLS: [&[u8]; 2] = [b"h2", b"http/1.1"];
 
@@ -117,9 +129,14 @@ async fn accept_loop(listener: TcpListener, transport: Transport, service: S3Ser
                 }
                 // Per-connection failures (the peer reset before the accept
                 // completed, the process is out of descriptors) are not the
-                // listener's death. Log and take the next one.
+                // listener's death. Log, pause, and take the next one. The
+                // pause is unconditional because the error alone does not say
+                // whether the cause has gone away; see ACCEPT_ERROR_BACKOFF.
+                // It delays a `Ctrl-C` by at most one backoff, since the next
+                // pass through the loop selects on the signal again.
                 Err(err) => {
                     tracing::warn!("accept failed: {err}");
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                     continue;
                 }
             },
