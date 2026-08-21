@@ -9,5 +9,8 @@ s3s = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+tokio = { workspace = true }
+
 [lints]
 workspace = true

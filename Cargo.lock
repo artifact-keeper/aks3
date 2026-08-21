@@ -48,6 +48,7 @@ dependencies = [
  "async-trait",
  "s3s",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
