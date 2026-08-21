@@ -20,6 +20,8 @@ dependencies = [
  "bytes",
  "futures",
  "s3s",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 
