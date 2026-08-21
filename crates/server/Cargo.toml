@@ -19,7 +19,6 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
-http-body-util = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 serde = { workspace = true }
@@ -28,12 +27,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-aws-config = "1"
 # Default features minus "rustls", which pulls the legacy rustls 0.21 stack and
 # with it rustls-webpki 0.101 (RUSTSEC-2026-0104). "default-https-client" is the
 # modern replacement and is already in the default set.
 aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
-aws-credential-types = "1"
 tempfile = { workspace = true }
 
 [lints]

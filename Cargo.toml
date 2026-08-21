@@ -39,7 +39,6 @@ toml = "0.8"
 http = "1"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "tokio", "service"] }
-http-body-util = "0.1"
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
 tempfile = "3"
