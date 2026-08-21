@@ -53,7 +53,6 @@
 //! staged files deleted underneath it. aks3 runs one engine per data directory.
 
 use std::io;
-use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -370,10 +369,7 @@ fn is_valid_bucket_name(name: &str) -> bool {
     if name.contains("..") || name.contains(".-") || name.contains("-.") {
         return false;
     }
-    // The charset below admits nothing but IPv4 among address forms, and Rust's
-    // parser is strict about what an IPv4 address is (four decimal octets, no
-    // leading zeros), which is the shape AWS rejects.
-    if name.parse::<Ipv4Addr>().is_ok() {
+    if looks_like_ipv4(name) {
         return false;
     }
     let bytes = name.as_bytes();
@@ -389,6 +385,26 @@ fn is_valid_bucket_name(name: &str) -> bool {
 /// The characters a bucket name may start and end with.
 fn is_bucket_alnum(b: u8) -> bool {
     b.is_ascii_lowercase() || b.is_ascii_digit()
+}
+
+/// Whether `name` has the shape of a dotted-decimal IPv4 address: exactly four
+/// groups of ASCII digits separated by dots.
+///
+/// This is a shape test, not an address parse, which is what `MinIO`'s
+/// `^(\d+\.){3}\d+$` does. `999.999.999.999`, `010.1.1.1` and `1.2.3.400` are
+/// not addresses any parser would accept, but they still read as one to a
+/// person or to a client building a virtual-host-style URL, and that is the
+/// confusion the rule exists to prevent. Five groups (`1.2.3.4.5`) do not match
+/// the shape and stay legal, as they do in `MinIO`.
+fn looks_like_ipv4(name: &str) -> bool {
+    let mut groups = name.split('.');
+    let four_decimal_groups = (0..4).all(|_| groups.next().is_some_and(is_decimal_group));
+    four_decimal_groups && groups.next().is_none()
+}
+
+/// A non-empty run of ASCII digits, the `\d+` of the shape above.
+fn is_decimal_group(g: &str) -> bool {
+    !g.is_empty() && g.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// When the bucket at `dir` was created.
@@ -707,8 +723,9 @@ mod tests {
             "a.b",
             "a1b2c3",
             "my-bucket.v2",
-            "010.1.1.1", // not an IPv4 address: octets do not take leading zeros
-            "1.2.3.4.5",
+            "1.2.3.4.5", // five groups is not the IPv4 shape
+            "1.2.3.4x",  // nor is a group that is not all digits
+            "12.34.56",  // nor are three groups
             longest.as_str(),
         ] {
             assert!(is_valid_bucket_name(good), "{good} should be valid");
@@ -732,9 +749,48 @@ mod tests {
             "192.168.1.1",
             "1.2.3.4",
             "255.255.255.255",
+            // IPv4-shaped without being addresses. The rule is about the shape:
+            // MinIO refuses these too.
+            "010.1.1.1",
+            "999.999.999.999",
+            "1.2.3.400",
+            "0.0.0.0",
             "caf\u{e9}s",
         ] {
             assert!(!is_valid_bucket_name(bad), "{bad} should be invalid");
+        }
+    }
+
+    #[test]
+    fn ipv4_shape_is_four_groups_of_digits() {
+        // Exactly what `^(\d+\.){3}\d+$` matches, addresses or not.
+        for shaped in [
+            "1.2.3.4",
+            "192.168.1.1",
+            "0.0.0.0",
+            "010.1.1.1",
+            "999.999.999.999",
+            "1.2.3.400",
+            "00000.0.0.00000",
+        ] {
+            assert!(looks_like_ipv4(shaped), "{shaped} has the IPv4 shape");
+        }
+        for unshaped in [
+            "",
+            "1.2.3",
+            "1.2.3.4.5",
+            "1.2.3.",
+            ".1.2.3",
+            "1..2.3",
+            "1.2.3.4x",
+            "1.2.3.-4",
+            "a.b.c.d",
+            "1234",
+        ] {
+            assert!(
+                !looks_like_ipv4(unshaped),
+                "{unshaped} does not have the IPv4 shape"
+            );
         }
     }
 
