@@ -556,6 +556,15 @@ impl ObjectLayer for FsEngine {
         Ok(object_info(key.to_owned(), &entry))
     }
 
+    /// Read the object's manifest, then open the version it names.
+    ///
+    /// Those are two steps with an await between them, and no lock spans them:
+    /// see the module's concurrency note for why a read holds none. A `DELETE`
+    /// landing in the gap removes the manifest and then the data, so the state
+    /// this observes is a version it just read whose file is already gone. That
+    /// is the object being deleted, not the store being broken, so it reports
+    /// [`EngineError::NoSuchKey`] and the API layer answers 404, which is what
+    /// S3 does with the same race.
     async fn get_object(
         &self,
         bucket: &str,
@@ -566,7 +575,14 @@ impl ObjectLayer for FsEngine {
         let entry = live_version(&dir).await?;
         let (offset, len) = resolve_range(range, entry.size)?;
 
-        let mut file = fs::File::open(dir.join(data_file_name(&entry.version_id))).await?;
+        let mut file = match fs::File::open(dir.join(data_file_name(&entry.version_id))).await {
+            Ok(file) => file,
+            // Only this one open is read as an absent object. Everywhere else a
+            // missing file is still an error, since nothing else has a
+            // concurrent delete as its likely explanation.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(EngineError::NoSuchKey),
+            Err(e) => return Err(e.into()),
+        };
         if offset > 0 {
             file.seek(SeekFrom::Start(offset)).await?;
         }
@@ -583,11 +599,14 @@ impl ObjectLayer for FsEngine {
     /// Remove the key's manifest and data, then prune the directories that
     /// held them.
     ///
-    /// The manifest goes first. A crash after it leaves data files nothing
-    /// points at, which read as an absent object and are swept by the next
-    /// write to the key; removing the data first would leave a manifest
-    /// advertising a version whose bytes are gone, which reads as a corrupt
-    /// object rather than a deleted one.
+    /// The manifest goes first, because it is what makes the object visible:
+    /// after that one rename the key reads as gone and everything below is
+    /// cleanup. A crash in between leaves data files nothing points at, which
+    /// the next write to the key replaces. The other order would leave a
+    /// manifest naming a version whose bytes are already gone; [`Self::get_object`]
+    /// reads that as an absent object too, but a crash would make it permanent,
+    /// leaving a key directory that holds its bucket open and a manifest entry
+    /// a versioned build would try to serve.
     ///
     /// Deleting a key that is not there succeeds, as it does in S3.
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), EngineError> {
@@ -1830,6 +1849,28 @@ mod tests {
             e.head_object("buk", "k").await,
             Err(EngineError::NoSuchKey)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_delete_landing_mid_read_reads_as_absent_not_as_a_broken_store() {
+        // delete_object removes the manifest first and the data second, so a
+        // GET that read the manifest just before it opens a path that is
+        // already gone. That is the object being deleted, and S3 answers the
+        // race with a 404, never an internal error.
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        e.put_object("buk", "k", body(b"v"), PutOpts::default())
+            .await
+            .unwrap();
+        std::fs::remove_file(obj_dir(&e, "buk", "k").join("__aks3.v.null.data")).unwrap();
+
+        assert!(matches!(
+            e.get_object("buk", "k", None).await,
+            Err(EngineError::NoSuchKey)
+        ));
+        // HEAD never opens the data file, so it still answers from the manifest
+        // it read, which is the same "whichever state it observed" promise.
+        assert_eq!(e.head_object("buk", "k").await.unwrap().size, 1);
     }
 
     #[tokio::test]
