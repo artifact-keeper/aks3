@@ -87,7 +87,6 @@ key_pem = "/etc/aks3/key.pem"
 export AWS_ACCESS_KEY_ID=admin
 export AWS_SECRET_ACCESS_KEY=secretpassword
 export AWS_REGION=us-east-1
-export AWS_S3_ADDRESSING_STYLE=path
 
 aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://demo
 aws --endpoint-url http://127.0.0.1:9000 s3 cp README.md s3://demo/readme.md
@@ -96,9 +95,23 @@ aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://demo/readme.md
 aws --endpoint-url http://127.0.0.1:9000 s3 rb s3://demo
 ```
 
-Path-style addressing is required. aks3 does not parse virtual-host style
-(`bucket.host`) requests yet, so a client that resolves buckets into hostnames
-will not find them.
+Path-style addressing is required, because aks3 does not parse virtual-host
+style (`bucket.host`) requests yet. Nothing above configures it: the AWS CLI
+already uses path style whenever `--endpoint-url` names a custom endpoint, so
+the block works as it stands.
+
+The one way to break that is to ask for the other style explicitly, with
+`addressing_style = virtual` under an `s3` key in `~/.aws/config`. A client
+configured that way puts the bucket in the hostname, aks3 does not recognise the
+request, and the answer is `NotImplemented`. If some profile has done that, set
+it back for this endpoint:
+
+```
+aws configure set default.s3.addressing_style path
+```
+
+That setting lives in the config file only. There is no environment variable for
+it, so exporting one has no effect.
 
 The same operations driven from the AWS SDK for Rust are what
 `crates/server/tests/smoke.rs` runs on every `cargo test`.
