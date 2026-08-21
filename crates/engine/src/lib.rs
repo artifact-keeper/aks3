@@ -5,4 +5,5 @@
 
 //! Placeholder crate root for Phase 0 scaffolding.
 
+pub mod atomic;
 pub mod paths;
