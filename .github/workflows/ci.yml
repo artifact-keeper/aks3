@@ -7,8 +7,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with: { components: "rustfmt, clippy" }
+      # Same version as rust-toolchain.toml, which is what cargo obeys inside
+      # the checkout. Naming it here too is what keeps the action from
+      # installing one compiler and the build from downloading another, and
+      # keeps the cache key describing the compiler actually used. The action
+      # has no way to read the file, so the two move together by hand.
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.98", components: "rustfmt, clippy" }
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -22,7 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.98" }
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
