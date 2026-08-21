@@ -24,8 +24,17 @@
 //! 4. `fsync` on the destination's *parent directory*, so the new directory entry
 //!    itself is durable. Without it the rename can be lost even though the data
 //!    survived.
+//! 5. `fsync` on each directory step 2 had to create, and on the deepest
+//!    directory that already existed, working up from the parent. A directory
+//!    created in step 2 is itself just an entry in its own parent, so syncing
+//!    only the immediate parent would leave a crash free to remove the entire
+//!    new subtree, object included, after `commit` returned `Ok`. Every first
+//!    write under a new key prefix takes this path.
 //!
-//! Steps 1 and 4 are correctness requirements, not tuning knobs.
+//! Steps 4 and 5 collapse into a single fsync in the common case, where the
+//! parent directory already exists.
+//!
+//! Steps 1, 4 and 5 are correctness requirements, not tuning knobs.
 //!
 //! Directory `fsync` is a Unix behaviour; this module assumes a Unix-like
 //! platform, as the rest of the storage engine does.
@@ -103,13 +112,16 @@ impl StagedFile {
     ///
     /// Propagates flush, fsync, `create_dir_all` and rename errors. If the error
     /// comes before the rename the temp file is cleaned up; after a successful
-    /// rename the data is published even if the final directory fsync reports an
+    /// rename the data is published even if a later directory fsync reports an
     /// error, and the temp file is gone either way.
     pub async fn commit(mut self, dest: &Path) -> io::Result<()> {
         self.file.flush().await?;
         self.file.sync_all().await?;
 
         let parent = parent_dir(dest);
+        // Computed before creating anything: afterwards every directory in the
+        // chain exists and there is no way to tell which ones are new.
+        let to_sync = dirs_to_sync(parent).await;
         fs::create_dir_all(parent).await?;
         fs::rename(&self.path, dest).await?;
         // The temp name no longer exists; deleting it in Drop would either fail
@@ -117,7 +129,10 @@ impl StagedFile {
         // this: the object is published from here on.
         self.committed = true;
 
-        File::open(parent).await?.sync_all().await
+        for dir in &to_sync {
+            File::open(dir).await?.sync_all().await?;
+        }
+        Ok(())
     }
 }
 
@@ -160,6 +175,38 @@ fn parent_dir(dest: &Path) -> &Path {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     }
+}
+
+/// Directories whose entries `commit` must fsync, deepest first.
+///
+/// That is `dir` itself, every ancestor `create_dir_all` will have to create,
+/// and the deepest ancestor that already exists. Each newly created directory
+/// gains an entry in its parent, and a directory entry is durable only once
+/// that parent is fsynced: syncing `dir` alone would leave a crash free to
+/// take the whole new subtree away with the object still reported as written.
+///
+/// Must be called before `create_dir_all`, while the distinction between new
+/// and pre-existing directories is still observable. In the common case, where
+/// `dir` already exists, the result is just `[dir]` and the cost over syncing
+/// `dir` alone is one `stat`.
+async fn dirs_to_sync(dir: &Path) -> Vec<PathBuf> {
+    let mut chain = Vec::new();
+    for ancestor in dir.ancestors() {
+        // `Path::ancestors` on a relative path ends at "", which names no
+        // directory; the directory it means is the current one.
+        let ancestor = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        chain.push(ancestor.to_path_buf());
+        // An unreadable ancestor is treated as missing: create_dir_all is about
+        // to fail on it anyway, and the fsync loop never runs.
+        if fs::try_exists(ancestor).await.unwrap_or(false) {
+            break;
+        }
+    }
+    chain
 }
 
 #[cfg(test)]
@@ -272,6 +319,79 @@ mod tests {
         assert_eq!(parent_dir(Path::new("x.bin")), Path::new("."));
         assert_eq!(parent_dir(Path::new("/")), Path::new("."));
         assert_eq!(parent_dir(Path::new("a/x.bin")), Path::new("a"));
+    }
+
+    #[tokio::test]
+    async fn dirs_to_sync_covers_the_whole_created_chain() {
+        let (guard, _tmp) = tmp_dir().await;
+        let root = guard.path();
+        let deepest = root.join("a/b/c");
+
+        // Every directory create_dir_all will make, plus `root`, which already
+        // exists and gains the entry for `a`. Deepest first.
+        assert_eq!(
+            dirs_to_sync(&deepest).await,
+            vec![
+                deepest.clone(),
+                root.join("a/b"),
+                root.join("a"),
+                root.to_path_buf(),
+            ]
+        );
+
+        // Once the chain exists, only the leaf gains an entry.
+        fs::create_dir_all(&deepest).await.unwrap();
+        assert_eq!(dirs_to_sync(&deepest).await, vec![deepest]);
+    }
+
+    #[tokio::test]
+    async fn steady_state_commit_syncs_only_the_destination_directory() {
+        // The fsync calls cannot be counted from a test, so this pins the input
+        // that decides them: committing into a directory that already exists
+        // must sync that one directory and nothing above it, exactly as before
+        // the chain fsync was added.
+        let (guard, tmp) = tmp_dir().await;
+        let dest_dir = guard.path().join("objects");
+        fs::create_dir_all(&dest_dir).await.unwrap();
+        assert_eq!(dirs_to_sync(&dest_dir).await, vec![dest_dir.clone()]);
+
+        let dest = dest_dir.join("out.bin");
+        let mut f = StagedFile::create(&tmp).await.unwrap();
+        f.write_all(b"steady").await.unwrap();
+        f.commit(&dest).await.unwrap();
+        assert_eq!(fs::read(&dest).await.unwrap(), b"steady");
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn dirs_to_sync_resolves_relative_paths_against_the_current_directory() {
+        // A relative parent's ancestors end at "", which names no directory.
+        let missing = Path::new("aks3-no-such-dir-4f2b71/inner");
+        assert_eq!(
+            dirs_to_sync(missing).await,
+            vec![
+                missing.to_path_buf(),
+                PathBuf::from("aks3-no-such-dir-4f2b71"),
+                PathBuf::from("."),
+            ]
+        );
+        assert_eq!(dirs_to_sync(Path::new(".")).await, vec![PathBuf::from(".")]);
+    }
+
+    #[tokio::test]
+    async fn commit_into_a_deep_new_chain_publishes_and_cleans_up() {
+        let (guard, tmp) = tmp_dir().await;
+        let dest = guard.path().join("objects/a/b/c/d/out.bin");
+
+        let mut f = StagedFile::create(&tmp).await.unwrap();
+        f.write_all(b"deep").await.unwrap();
+        f.commit(&dest).await.unwrap();
+
+        assert_eq!(fs::read(&dest).await.unwrap(), b"deep");
+        for dir in dest.ancestors().skip(1).take_while(|d| *d != guard.path()) {
+            assert!(dir.is_dir(), "{dir:?} was not created");
+        }
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
     }
 
     #[tokio::test]
