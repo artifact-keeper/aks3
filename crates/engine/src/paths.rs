@@ -34,6 +34,15 @@
 //! and bytes that do not reassemble into UTF-8 yield [`PathError::NonUtf8`]. A
 //! name that decodes to anything else containing a `/` is rejected rather than
 //! spliced into the key, since encoding never produces one.
+//!
+//! # Version IDs
+//!
+//! Version IDs also reach the filesystem, via [`data_file_name`], and arrive
+//! from the client as `?versionId=`. They get their own narrower escaping: any
+//! byte outside `[A-Za-z0-9._-]` is percent-escaped, so the name is always a
+//! single component no matter what the client sent. [`is_valid_version_id`]
+//! reports whether an ID is well-formed, for callers that would rather reject
+//! it at the API edge.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -161,10 +170,51 @@ pub fn rel_path_to_key(p: &Path) -> Result<String, PathError> {
     Ok(parts.join("/"))
 }
 
+/// Whether `version_id` is well-formed: `[A-Za-z0-9._-]+` containing no `..`
+/// and at least one alphanumeric character.
+///
+/// Every version ID aks3 mints passes (UUIDs, and the literal `"null"` for the
+/// unversioned placeholder). A client-supplied `?versionId=` is untrusted, so
+/// callers should reject one that fails this check at the API edge with an
+/// `InvalidArgument` rather than looking it up. [`data_file_name`] is safe
+/// either way; rejecting early just gives a clearer error than a lookup miss on
+/// an escaped name.
+#[must_use]
+pub fn is_valid_version_id(version_id: &str) -> bool {
+    !version_id.contains("..")
+        && version_id.bytes().any(|b| b.is_ascii_alphanumeric())
+        && version_id.bytes().all(is_safe_version_byte)
+}
+
 /// Name of the data file holding the bytes of one object version.
+///
+/// The result is always exactly one relative path component: any byte outside
+/// `[A-Za-z0-9._-]` is percent-escaped, so `/`, `\` and control bytes cannot
+/// survive into the name and a hostile `version_id` cannot climb out of the
+/// object directory it is joined onto. The escaping is injective, so two
+/// distinct version IDs never name the same file. A `version_id` satisfying
+/// [`is_valid_version_id`] is emitted verbatim.
 #[must_use]
 pub fn data_file_name(version_id: &str) -> String {
-    format!("__aks3.v.{version_id}.data")
+    const PREFIX: &str = "__aks3.v.";
+    const SUFFIX: &str = ".data";
+
+    let mut out = String::with_capacity(PREFIX.len() + version_id.len() + SUFFIX.len());
+    out.push_str(PREFIX);
+    for &b in version_id.as_bytes() {
+        if is_safe_version_byte(b) {
+            out.push(char::from(b));
+        } else {
+            push_escape(&mut out, b);
+        }
+    }
+    out.push_str(SUFFIX);
+    out
+}
+
+/// Bytes that may appear unescaped in a data file name.
+fn is_safe_version_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')
 }
 
 /// Whether a byte must be percent-encoded under rule 2.
@@ -194,6 +244,7 @@ fn hex_val(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn roundtrip_plain() {
@@ -237,6 +288,118 @@ mod tests {
     #[test]
     fn data_file_names() {
         assert_eq!(data_file_name("null"), "__aks3.v.null.data");
+    }
+
+    #[test]
+    fn data_file_name_escapes_path_hostile_ids() {
+        assert_eq!(data_file_name("null"), "__aks3.v.null.data");
+        assert_eq!(
+            data_file_name("../../etc/passwd"),
+            "__aks3.v...%2F..%2Fetc%2Fpasswd.data"
+        );
+        assert_eq!(data_file_name("a/b"), "__aks3.v.a%2Fb.data");
+        assert_eq!(data_file_name("a\\b"), "__aks3.v.a%5Cb.data");
+        assert_eq!(data_file_name("a b"), "__aks3.v.a%20b.data");
+        assert_eq!(data_file_name("a%b"), "__aks3.v.a%25b.data");
+        assert_eq!(data_file_name("\u{0}"), "__aks3.v.%00.data");
+    }
+
+    #[test]
+    fn data_file_name_is_always_one_safe_component() {
+        for id in [
+            "null",
+            "",
+            ".",
+            "..",
+            "../../etc/passwd",
+            "/",
+            "//",
+            "/etc/passwd",
+            "a/b",
+            "a\\b",
+            "..\\..\\windows",
+            "a%2Fb",
+            "\u{0}\u{1f}\u{7f}",
+            "caf\u{e9}",
+            "\u{1f600}",
+        ] {
+            let name = data_file_name(id);
+            assert!(!name.contains('/'), "{id:?} produced {name:?} with a slash");
+            assert!(
+                !name.contains('\\'),
+                "{id:?} produced {name:?} with a backslash"
+            );
+            assert!(name.starts_with(RESERVED_PREFIX), "{id:?} lost its prefix");
+            // strip_suffix, not ends_with: the suffix we emit is always exactly
+            // ".data", and clippy pushes ends_with toward a case-insensitive
+            // Path::extension check that would weaken the assertion.
+            assert!(
+                name.strip_suffix(".data").is_some(),
+                "{id:?} lost its suffix"
+            );
+            let p = Path::new(&name);
+            assert!(p.is_relative(), "{id:?} produced an absolute path");
+            let comps: Vec<_> = p.components().collect();
+            assert_eq!(comps.len(), 1, "{id:?} produced {comps:?}");
+            assert!(
+                matches!(comps[0], Component::Normal(_)),
+                "{id:?} produced {comps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn data_file_name_is_injective() {
+        let ids = ["a/b", "a%2Fb", "a%252Fb", "a\\b", "ab", "a.b", "a b"];
+        let names: BTreeSet<String> = ids.iter().map(|i| data_file_name(i)).collect();
+        assert_eq!(names.len(), ids.len(), "two version IDs share a file name");
+    }
+
+    #[test]
+    fn version_id_validation() {
+        for ok in [
+            "null",
+            "0198f0c1-7b3a-7e2d-9f01-2c3d4e5f6a7b",
+            "abc",
+            "A1",
+            "a.b",
+            "a_b",
+            "a-b",
+            "9",
+        ] {
+            assert!(is_valid_version_id(ok), "{ok:?} should be valid");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "...",
+            "../x",
+            "a/b",
+            "a\\b",
+            "a b",
+            "a%b",
+            "..a",
+            "a..b",
+            "a..",
+            "\u{0}",
+            "caf\u{e9}",
+            "a\nb",
+        ] {
+            assert!(!is_valid_version_id(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn valid_version_ids_are_never_escaped() {
+        for id in [
+            "null",
+            "0198f0c1-7b3a-7e2d-9f01-2c3d4e5f6a7b",
+            "a.b",
+            "a_b-1",
+        ] {
+            assert_eq!(data_file_name(id), format!("__aks3.v.{id}.data"));
+        }
     }
 
     // --- additional cases beyond the brief ---
