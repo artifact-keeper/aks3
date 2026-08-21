@@ -76,9 +76,17 @@
 //! Both tables drop an entry once nothing holds it, so they stay the size of
 //! the concurrent work rather than growing with every key ever written.
 //!
-//! Reads take neither lock. A `GET` racing a `DELETE` of the same key reports
-//! whichever state it observed, which is what S3 promises; holding a lock for
-//! the life of a response stream would let one slow reader block every writer.
+//! Reads of one key take neither lock. A `GET` racing a `DELETE` of the same
+//! key reports whichever state it observed, which is what S3 promises; holding
+//! a lock for the life of a response stream would let one slow reader block
+//! every writer.
+//!
+//! A listing does take the bucket lock, shared. It reads the whole tree rather
+//! than one key, and `delete_bucket`'s `remove_dir_all` would otherwise pull
+//! that tree out from under the walk, turning "the bucket was deleted" into I/O
+//! errors. Shared is enough: writers hold it shared too, so a listing still
+//! runs alongside every `PUT` and `DELETE`, and only sees each key as of
+//! whenever it reached it.
 //!
 //! The locks live in this process, so they order the requests one server
 //! handles. Two servers over one data directory are not supported, as
@@ -107,6 +115,7 @@ use crate::meta::{
     load_manifest, store_manifest, VersionEntry, VersionManifest, MANIFEST_FORMAT, NULL_VERSION_ID,
 };
 use crate::paths::{data_file_name, key_to_rel_path, META_FILE};
+use crate::walk;
 
 /// Layout version stamped on `<root>/.aks3/format.json`.
 ///
@@ -635,12 +644,104 @@ impl ObjectLayer for FsEngine {
         Ok(())
     }
 
+    /// Walk the bucket's object tree, then cut one page out of the keys.
+    ///
+    /// # Ordering and paging
+    ///
+    /// Keys come back in ascending UTF-8 order, and the page is the run of
+    /// items strictly after the start bound. The bound is the later of
+    /// `continuation_token` and `start_after`, and it is compared against the
+    /// *item* a key produces rather than the key itself: with a delimiter that
+    /// item is the common prefix the key folds into, and comparing the key
+    /// instead would make a token that names a common prefix (`dir/`) re-emit
+    /// every key under it (`dir/one` is above `dir/`), which folds back to the
+    /// same common prefix and never advances. The cost is that `start_after`
+    /// naming a key inside a folded group skips the whole group, which is what
+    /// `MinIO` does with the equivalent marker.
+    ///
+    /// # Phase 0 simplification
+    ///
+    /// The whole keyspace is materialised and sorted before the page is taken
+    /// from it, so listing ten keys of a million walks all million directories,
+    /// and does it again for the next page. Correctness first: a lazy walk that
+    /// descends only into the subtrees a prefix can reach, and stops once the
+    /// page is full, is a later optimisation that changes no behaviour visible
+    /// here.
     async fn list_objects_v2(
         &self,
-        _bucket: &str,
-        _p: &ListParams,
+        bucket: &str,
+        p: &ListParams,
     ) -> Result<ListResult, EngineError> {
-        Err(not_yet_implemented())
+        // Rejects an illegal name before it reaches the lock table.
+        self.checked_bucket_dir(bucket)?;
+        // Shared, so it holds off delete_bucket without holding off writers.
+        // Without it a remove_dir_all could take the tree away mid-walk, and a
+        // listing would report I/O errors for a bucket that is simply gone.
+        let _bucket_lock = self.lock_bucket_shared(bucket).await;
+        let bucket_dir = self.existing_bucket_dir(bucket).await?;
+
+        // A legal request for nothing, and the only case where a full budget is
+        // not a truncated listing. Answered before the walk, since walking a
+        // tree to report none of it is pure cost.
+        let mut out = ListResult::default();
+        if p.max_keys == 0 {
+            return Ok(out);
+        }
+
+        let objects_dir = bucket_dir.join(OBJECTS_DIR);
+        // A blocking walk of the tree; see `walk` for why it is not async. A
+        // join error means it panicked, since nothing here cancels it.
+        let keys = tokio::task::spawn_blocking(move || walk::sorted_keys(&objects_dir))
+            .await
+            .map_err(io::Error::other)??;
+
+        let prefix = p.prefix.as_deref().unwrap_or_default();
+        // An empty delimiter folds nothing: every key would "contain" it at
+        // offset zero and the whole listing would collapse to one prefix.
+        let delimiter = p.delimiter.as_deref().filter(|d| !d.is_empty());
+        let start = start_bound(p);
+
+        for key in &keys {
+            if !key.starts_with(prefix) {
+                continue;
+            }
+            let folded = delimiter.and_then(|d| common_prefix_of(key, prefix.len(), d));
+            let item = folded.as_deref().unwrap_or(key);
+            if start.is_some_and(|start| item <= start) {
+                continue;
+            }
+            // Keys of one group are contiguous in sorted order, so the group
+            // already counted is always the last one emitted. Checking before
+            // reading the manifest is what keeps a folded listing from paying
+            // for every key it hides.
+            if folded.is_some()
+                && out.common_prefixes.last().map(String::as_str) == folded.as_deref()
+            {
+                continue;
+            }
+            // Deleted between the walk and here, or a delete-marker head: not
+            // an item, so it neither fills the budget nor opens a group.
+            let Some(entry) = listable_version(&Self::object_dir(&bucket_dir, key)).await? else {
+                continue;
+            };
+            // Found one more item than fits, which is what "truncated" means.
+            if out.objects.len() + out.common_prefixes.len() == p.max_keys {
+                out.is_truncated = true;
+                break;
+            }
+            // The token is the last item emitted, whichever kind it was.
+            if let Some(common) = folded {
+                out.next_continuation_token = Some(common.clone());
+                out.common_prefixes.push(common);
+            } else {
+                out.next_continuation_token = Some(key.clone());
+                out.objects.push(object_info(key.clone(), &entry));
+            }
+        }
+        if !out.is_truncated {
+            out.next_continuation_token = None;
+        }
+        Ok(out)
     }
 }
 
@@ -794,6 +895,46 @@ async fn live_version(dir: &Path) -> Result<VersionEntry, EngineError> {
     }
 }
 
+/// The version a listing reports for the object at `dir`, or `None` if there is
+/// nothing to report.
+///
+/// Unlike a `GET`, an absent key here is ordinary: the walk names keys it saw,
+/// and one can be deleted before its manifest is read. A delete-marker head is
+/// the same absence recorded in the manifest rather than by removing it.
+async fn listable_version(dir: &Path) -> Result<Option<VersionEntry>, EngineError> {
+    match live_version(dir).await {
+        Ok(entry) => Ok(Some(entry)),
+        Err(EngineError::NoSuchKey) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The key a listing starts strictly after, or `None` to start at the
+/// beginning.
+///
+/// Both bounds are exclusive and both may be given, in which case the later one
+/// wins: each says "not before here", so the answer has to satisfy both.
+fn start_bound(p: &ListParams) -> Option<&str> {
+    match (p.continuation_token.as_deref(), p.start_after.as_deref()) {
+        (Some(token), Some(after)) => Some(token.max(after)),
+        (token, after) => token.or(after),
+    }
+}
+
+/// The common prefix `key` folds into, or `None` if it holds no `delimiter`
+/// after the listing prefix.
+///
+/// The result runs from the start of the key through the first delimiter past
+/// `prefix_len`, delimiter included, which is the form S3 reports.
+///
+/// `prefix_len` is the length of a prefix the caller has already matched, so it
+/// is a character boundary, and so is the end of a delimiter that was found by
+/// searching from there.
+fn common_prefix_of(key: &str, prefix_len: usize, delimiter: &str) -> Option<String> {
+    let at = key[prefix_len..].find(delimiter)?;
+    Some(key[..prefix_len + at + delimiter.len()].to_owned())
+}
+
 /// Resolve `range` against an object of `size` bytes, yielding the offset to
 /// read from and the number of bytes to send.
 ///
@@ -943,15 +1084,6 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0x0F) as usize]);
     }
     out
-}
-
-/// The listing method lands in Task 7. Until then it fails loudly rather than
-/// pretending an empty store.
-fn not_yet_implemented() -> EngineError {
-    EngineError::Io(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "not yet implemented",
-    ))
 }
 
 #[cfg(test)]
@@ -2104,16 +2236,462 @@ mod tests {
         );
     }
 
-    /// Delete this once Task 7 has replaced the listing stub.
-    #[tokio::test]
-    async fn listing_is_not_implemented_yet() {
-        let (_d, e) = eng().await;
-        e.create_bucket("photos").await.unwrap();
+    // --- listing ---
 
-        let Err(EngineError::Io(err)) = e.list_objects_v2("photos", &ListParams::default()).await
-        else {
-            panic!("expected an unimplemented error");
+    async fn seed(e: &FsEngine) {
+        e.create_bucket("buk").await.unwrap();
+        for k in ["a.txt", "dir/one", "dir/two", "dir/sub/deep", "z.txt"] {
+            e.put_object("buk", k, body(b"x"), PutOpts::default())
+                .await
+                .unwrap();
+        }
+    }
+
+    fn listed(r: &ListResult) -> Vec<String> {
+        r.objects.iter().map(|o| o.key.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn plain_listing_sorted() {
+        let (_d, e) = eng().await;
+        seed(&e).await;
+        let r = e
+            .list_objects_v2(
+                "buk",
+                &ListParams {
+                    max_keys: 1000,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            listed(&r),
+            vec!["a.txt", "dir/one", "dir/sub/deep", "dir/two", "z.txt"]
+        );
+        assert!(!r.is_truncated);
+    }
+
+    #[tokio::test]
+    async fn delimiter_folds_common_prefixes() {
+        let (_d, e) = eng().await;
+        seed(&e).await;
+        let r = e
+            .list_objects_v2(
+                "buk",
+                &ListParams {
+                    delimiter: Some("/".into()),
+                    max_keys: 1000,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed(&r), vec!["a.txt", "z.txt"]);
+        assert_eq!(r.common_prefixes, vec!["dir/"]);
+    }
+
+    #[tokio::test]
+    async fn prefix_and_delimiter() {
+        let (_d, e) = eng().await;
+        seed(&e).await;
+        let r = e
+            .list_objects_v2(
+                "buk",
+                &ListParams {
+                    prefix: Some("dir/".into()),
+                    delimiter: Some("/".into()),
+                    max_keys: 1000,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed(&r), vec!["dir/one", "dir/two"]);
+        assert_eq!(r.common_prefixes, vec!["dir/sub/"]);
+    }
+
+    #[tokio::test]
+    async fn pagination_with_continuation() {
+        let (_d, e) = eng().await;
+        seed(&e).await;
+        let p1 = e
+            .list_objects_v2(
+                "buk",
+                &ListParams {
+                    max_keys: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(p1.objects.len(), 2);
+        assert!(p1.is_truncated);
+        let p2 = e
+            .list_objects_v2(
+                "buk",
+                &ListParams {
+                    max_keys: 2,
+                    continuation_token: p1.next_continuation_token.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(p2.objects[0].key, "dir/sub/deep");
+        let p3 = e
+            .list_objects_v2(
+                "buk",
+                &ListParams {
+                    max_keys: 100,
+                    continuation_token: p2.next_continuation_token.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(p3.objects.len(), 1);
+        assert!(!p3.is_truncated);
+        assert!(p3.next_continuation_token.is_none());
+    }
+
+    // --- listing cases beyond the brief ---
+
+    /// A listing of `bucket` with the defaults and a budget nothing here
+    /// reaches.
+    async fn list(e: &FsEngine, bucket: &str, p: ListParams) -> ListResult {
+        e.list_objects_v2(
+            bucket,
+            &ListParams {
+                max_keys: 1000,
+                ..p
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Make the head of `key`'s manifest a delete marker. Phase 0 never writes
+    /// one, but a listing has to skip it before versioning starts to.
+    async fn mark_deleted(e: &FsEngine, bucket: &str, key: &str) {
+        let path = obj_dir(e, bucket, key).join(META_FILE);
+        let mut m = load_manifest(&path).await.unwrap().unwrap();
+        m.versions[0].delete_marker = true;
+        store_manifest(&e.tmp_dir(), &path, &m).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn listing_reports_the_bucket_it_was_asked_for() {
+        let (_d, e) = eng().await;
+        seed(&e).await;
+        assert!(matches!(
+            e.list_objects_v2("other", &ListParams::default()).await,
+            Err(EngineError::NoSuchBucket)
+        ));
+        assert!(matches!(
+            e.list_objects_v2("../escape", &ListParams::default()).await,
+            Err(EngineError::InvalidBucketName)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_bucket_with_no_object_tree_lists_empty() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        // Nothing has been written, so `objects/` does not exist yet.
+        assert!(!e.bucket_dir("buk").join("objects").exists());
+
+        let r = list(&e, "buk", ListParams::default()).await;
+        assert!(r.objects.is_empty());
+        assert!(r.common_prefixes.is_empty());
+        assert!(!r.is_truncated);
+    }
+
+    #[tokio::test]
+    async fn max_keys_zero_is_an_empty_page_that_is_not_truncated() {
+        let (_d, e) = eng().await;
+        seed(&e).await;
+        let r = e
+            .list_objects_v2("buk", &ListParams::default())
+            .await
+            .unwrap();
+        assert!(r.objects.is_empty());
+        assert!(!r.is_truncated);
+        assert!(r.next_continuation_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_page_that_exactly_holds_the_listing_is_not_truncated() {
+        let (_d, e) = eng().await;
+        seed(&e).await;
+        let r = e
+            .list_objects_v2(
+                "buk",
+                &ListParams {
+                    max_keys: 5,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.objects.len(), 5);
+        assert!(!r.is_truncated);
+        assert!(r.next_continuation_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn paging_a_folded_listing_advances_past_the_common_prefix() {
+        let (_d, e) = eng().await;
+        seed(&e).await;
+        let page = |token: Option<String>| async {
+            e.list_objects_v2(
+                "buk",
+                &ListParams {
+                    delimiter: Some("/".into()),
+                    continuation_token: token,
+                    max_keys: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
         };
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+
+        let p1 = page(None).await;
+        assert_eq!(listed(&p1), vec!["a.txt"]);
+        assert!(p1.is_truncated);
+
+        // The token names a common prefix, and every key under it is above it.
+        // Resuming has to skip the whole group rather than fold it again.
+        let p2 = page(p1.next_continuation_token.clone()).await;
+        assert!(p2.objects.is_empty());
+        assert_eq!(p2.common_prefixes, vec!["dir/"]);
+        assert_eq!(p2.next_continuation_token.as_deref(), Some("dir/"));
+        assert!(p2.is_truncated);
+
+        let p3 = page(p2.next_continuation_token.clone()).await;
+        assert_eq!(listed(&p3), vec!["z.txt"]);
+        assert!(!p3.is_truncated);
+    }
+
+    #[tokio::test]
+    async fn the_later_of_the_token_and_start_after_wins() {
+        let (_d, e) = eng().await;
+        seed(&e).await;
+        for (token, after) in [("a.txt", "dir/two"), ("dir/two", "a.txt")] {
+            let r = list(
+                &e,
+                "buk",
+                ListParams {
+                    continuation_token: Some(token.into()),
+                    start_after: Some(after.into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(listed(&r), vec!["z.txt"], "{token} / {after}");
+        }
+    }
+
+    #[tokio::test]
+    async fn start_after_alone_is_exclusive() {
+        let (_d, e) = eng().await;
+        seed(&e).await;
+        let r = list(
+            &e,
+            "buk",
+            ListParams {
+                start_after: Some("dir/one".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(listed(&r), vec!["dir/sub/deep", "dir/two", "z.txt"]);
+    }
+
+    #[tokio::test]
+    async fn a_prefix_can_cut_a_key_component_in_half() {
+        let (_d, e) = eng().await;
+        seed(&e).await;
+        let r = list(
+            &e,
+            "buk",
+            ListParams {
+                prefix: Some("di".into()),
+                delimiter: Some("/".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        // The fold starts looking for the delimiter after the prefix, so the
+        // group is the whole first component, not `di`.
+        assert!(r.objects.is_empty());
+        assert_eq!(r.common_prefixes, vec!["dir/"]);
+    }
+
+    #[tokio::test]
+    async fn a_delimiter_need_not_be_a_slash() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        for k in ["aXXb", "aXXc", "plain"] {
+            e.put_object("buk", k, body(b"x"), PutOpts::default())
+                .await
+                .unwrap();
+        }
+        let r = list(
+            &e,
+            "buk",
+            ListParams {
+                delimiter: Some("XX".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(listed(&r), vec!["plain"]);
+        assert_eq!(r.common_prefixes, vec!["aXX"]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_delimiter_folds_nothing() {
+        let (_d, e) = eng().await;
+        seed(&e).await;
+        let r = list(
+            &e,
+            "buk",
+            ListParams {
+                delimiter: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(r.objects.len(), 5);
+        assert!(r.common_prefixes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_deleted_key_leaves_the_listing() {
+        let (_d, e) = eng().await;
+        seed(&e).await;
+        e.delete_object("buk", "dir/sub/deep").await.unwrap();
+        e.delete_object("buk", "a.txt").await.unwrap();
+
+        let r = list(&e, "buk", ListParams::default()).await;
+        assert_eq!(listed(&r), vec!["dir/one", "dir/two", "z.txt"]);
+    }
+
+    #[tokio::test]
+    async fn delete_marker_heads_are_skipped() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        for k in ["gone/a", "gone/b", "live/x", "z"] {
+            e.put_object("buk", k, body(b"x"), PutOpts::default())
+                .await
+                .unwrap();
+        }
+        for k in ["gone/a", "gone/b"] {
+            mark_deleted(&e, "buk", k).await;
+        }
+
+        let flat = list(&e, "buk", ListParams::default()).await;
+        assert_eq!(listed(&flat), vec!["live/x", "z"]);
+
+        // A group whose every key is a tombstone is not a common prefix, and
+        // neither the keys nor the group it would have opened take a slot.
+        let folded = e
+            .list_objects_v2(
+                "buk",
+                &ListParams {
+                    delimiter: Some("/".into()),
+                    max_keys: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(folded.objects.is_empty());
+        assert_eq!(folded.common_prefixes, vec!["live/"]);
+        assert!(folded.is_truncated);
+    }
+
+    #[tokio::test]
+    async fn a_listing_entry_carries_the_whole_object() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        let mut opts = PutOpts {
+            content_type: Some("text/plain".into()),
+            ..Default::default()
+        };
+        opts.user_metadata.insert("owner".into(), "khan".into());
+        let put = e
+            .put_object("buk", "k", body(b"hello"), opts)
+            .await
+            .unwrap();
+
+        let r = list(&e, "buk", ListParams::default()).await;
+        let [got] = &r.objects[..] else {
+            panic!("expected one object, got {:?}", r.objects);
+        };
+        assert_eq!(got.key, "k");
+        assert_eq!(got.size, 5);
+        assert_eq!(got.etag, put.etag);
+        assert_eq!(got.content_type, "text/plain");
+        assert_eq!(got.user_metadata.get("owner").unwrap(), "khan");
+        assert_eq!(got.mtime_epoch_ms, put.mtime_epoch_ms);
+    }
+
+    #[tokio::test]
+    async fn keys_the_filesystem_would_choke_on_come_back_intact_and_in_order() {
+        let (_d, e) = eng().await;
+        e.create_bucket("buk").await.unwrap();
+        let keys = [
+            "",
+            "..",
+            META_FILE,
+            "a/",
+            "a/b",
+            "caf\u{e9}",
+            "pct%",
+            "tab\tx",
+            "\u{1f600}/emoji",
+        ];
+        for k in keys {
+            e.put_object("buk", k, body(b"x"), PutOpts::default())
+                .await
+                .unwrap();
+        }
+        let mut want: Vec<String> = keys.iter().map(|k| (*k).to_owned()).collect();
+        want.sort_unstable();
+
+        let r = list(&e, "buk", ListParams::default()).await;
+        assert_eq!(listed(&r), want);
+    }
+
+    #[test]
+    fn the_start_bound_is_the_later_of_the_two() {
+        let params = |token: Option<&str>, after: Option<&str>| ListParams {
+            continuation_token: token.map(str::to_owned),
+            start_after: after.map(str::to_owned),
+            ..Default::default()
+        };
+        assert_eq!(start_bound(&params(None, None)), None);
+        assert_eq!(start_bound(&params(Some("a"), None)), Some("a"));
+        assert_eq!(start_bound(&params(None, Some("b"))), Some("b"));
+        assert_eq!(start_bound(&params(Some("a"), Some("b"))), Some("b"));
+        assert_eq!(start_bound(&params(Some("b"), Some("a"))), Some("b"));
+    }
+
+    #[test]
+    fn folding_takes_the_first_delimiter_past_the_prefix() {
+        assert_eq!(common_prefix_of("a/b/c", 0, "/").unwrap(), "a/");
+        assert_eq!(common_prefix_of("a/b/c", 2, "/").unwrap(), "a/b/");
+        assert_eq!(common_prefix_of("a/b/c", 4, "/"), None);
+        assert_eq!(common_prefix_of("aXXbXXc", 0, "XX").unwrap(), "aXX");
+        // A key ending in the delimiter folds into itself.
+        assert_eq!(common_prefix_of("a/", 0, "/").unwrap(), "a/");
+        // Multi-byte characters either side of the delimiter.
+        assert_eq!(
+            common_prefix_of("\u{1f600}/x", 0, "/").unwrap(),
+            "\u{1f600}/"
+        );
     }
 }

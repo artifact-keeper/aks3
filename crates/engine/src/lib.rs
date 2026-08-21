@@ -8,7 +8,8 @@
 //! [`ObjectLayer`] is the contract the API layer codes against, and
 //! [`FsEngine`] is the single-disk implementation of it. Everything else here
 //! is the machinery those two need: key-to-path encoding ([`paths`]), crash-safe
-//! writes ([`atomic`]) and the per-object version manifest ([`meta`]).
+//! writes ([`atomic`]), the per-object version manifest ([`meta`]) and the walk
+//! that turns an object tree back into keys ([`walk`]).
 
 pub mod atomic;
 pub mod error;
@@ -16,6 +17,7 @@ pub mod fs_engine;
 pub mod layer;
 pub mod meta;
 pub mod paths;
+pub mod walk;
 
 pub use error::EngineError;
 pub use fs_engine::FsEngine;
