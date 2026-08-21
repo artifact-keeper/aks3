@@ -32,6 +32,10 @@ Build the binary:
 cargo build --release
 ```
 
+`rust-toolchain.toml` pins the compiler to 1.98, so rustup picks it up without
+being asked. The oldest compiler the workspace builds on is 1.94.1, recorded as
+`rust-version` in the root `Cargo.toml`.
+
 Write `aks3.toml`:
 
 ```toml

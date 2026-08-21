@@ -5,6 +5,11 @@ members = ["crates/server", "crates/api", "crates/engine", "crates/iam"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# The floor is set by the AWS SDK crates the server's smoke test builds
+# against, which is above what aks3's own code needs. Cargo reports it as a
+# clear "requires rustc 1.94.1" rather than the wall of errors an unsupported
+# compiler would otherwise produce partway through a dependency.
+rust-version = "1.94.1"
 license = "AGPL-3.0-only"
 repository = "https://example.invalid/aks3"
 

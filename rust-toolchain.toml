@@ -1,0 +1,13 @@
+# The compiler this repository is built and linted with.
+#
+# Pinned to a concrete version rather than "stable" on purpose: clippy's
+# pedantic set is what CI enforces, and it gains lints with every release, so a
+# bare "stable" means a contributor and CI can disagree about whether the tree
+# is clean depending on when each last updated. Bumping this is a deliberate
+# commit that comes with whatever lint fixes the new compiler asks for.
+#
+# The workspace's rust-version is the separate, lower floor: the oldest
+# compiler the code is expected to build on.
+[toolchain]
+channel = "1.98"
+components = ["clippy", "rustfmt"]
