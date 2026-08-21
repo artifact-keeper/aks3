@@ -8,9 +8,9 @@
 //! Every key has exactly one manifest, holding one [`VersionEntry`] per version,
 //! newest first. Storage is versioning-native: an unversioned bucket is not a
 //! separate code path, it is a manifest whose single entry carries the reserved
-//! id [`NULL_VERSION_ID`], and overwriting that object replaces the entry in
-//! place rather than growing history. Turning versioning on later therefore
-//! needs no migration.
+//! id [`NULL_VERSION_ID`], and overwriting that object replaces that entry
+//! rather than growing history. Turning versioning on later therefore needs no
+//! migration.
 //!
 //! A deletion is also an entry, with [`VersionEntry::delete_marker`] set, so the
 //! object's tombstone participates in ordering like any other version. That is
@@ -25,7 +25,9 @@
 //! [`VersionManifest::format`] is stamped on every manifest written, so a future
 //! layout change can be recognised rather than guessed at. Fields that arrived
 //! after the first release are `serde(default)`, letting a newer binary read an
-//! older manifest untouched.
+//! older manifest untouched. In the other direction [`load_manifest`] refuses a
+//! manifest newer than this build understands, rather than parsing away the
+//! fields it does not know and writing the remains back.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -84,22 +86,21 @@ impl VersionManifest {
         self.versions.first()
     }
 
-    /// Insert `e`, or replace the entry that already carries its version id.
+    /// Insert `e` as the latest version, replacing any entry that already
+    /// carries its version id.
     ///
-    /// A new id becomes the latest version. Replacement happens in place and
-    /// keeps the entry's position, which is what makes an overwrite in an
-    /// unversioned bucket a no-growth operation on [`NULL_VERSION_ID`], and
-    /// keeps history ordered when an existing version's metadata is rewritten.
+    /// The entry always ends up at index 0, whether or not it replaced one:
+    /// in S3, an overwrite *becomes* the current version. That matters when
+    /// versioning is suspended and a `PUT` rewrites [`NULL_VERSION_ID`] on a
+    /// key that already has newer versioned entries above it. Replacing the
+    /// null entry where it sat would leave [`Self::latest`] pointing at an
+    /// older version that the client just overwrote.
+    ///
+    /// The unversioned case still never grows history: the old null entry is
+    /// removed as the new one goes in.
     pub fn upsert(&mut self, e: VersionEntry) {
-        if let Some(slot) = self
-            .versions
-            .iter_mut()
-            .find(|v| v.version_id == e.version_id)
-        {
-            *slot = e;
-        } else {
-            self.versions.insert(0, e);
-        }
+        self.versions.retain(|v| v.version_id != e.version_id);
+        self.versions.insert(0, e);
     }
 
     /// Drop the entry with `version_id`, returning it. `None` if no such version.
@@ -118,19 +119,35 @@ impl VersionManifest {
 /// parsed is an error, not an absent object: reporting `None` would present a
 /// corrupt file as an empty history and invite the next write to overwrite it.
 ///
+/// A manifest stamped with a format newer than [`MANIFEST_FORMAT`] is refused
+/// for the same reason. Deserialization ignores fields this build does not know
+/// about, so parsing one and writing it back would silently drop them while
+/// leaving the newer format number in place, hiding the loss from the binary
+/// that wrote it. Older formats are still read; only newer ones are refused.
+///
 /// # Errors
 ///
-/// Propagates read errors other than [`io::ErrorKind::NotFound`], and reports a
-/// parse failure as [`io::ErrorKind::InvalidData`].
+/// Propagates read errors other than [`io::ErrorKind::NotFound`]. Reports a
+/// parse failure or an unsupported format as [`io::ErrorKind::InvalidData`].
 pub async fn load_manifest(path: &Path) -> io::Result<Option<VersionManifest>> {
     let bytes = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    let m: VersionManifest = serde_json::from_slice(&bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if m.format > MANIFEST_FORMAT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "manifest format {} at {} is newer than the supported format {MANIFEST_FORMAT}",
+                m.format,
+                path.display(),
+            ),
+        ));
+    }
+    Ok(Some(m))
 }
 
 /// Write `m` to `path` atomically, staging through `tmp`.
@@ -229,14 +246,22 @@ mod tests {
     }
 
     #[test]
-    fn upsert_replaces_a_non_head_version_without_reordering() {
-        // Replacement is in place, so history order (newest first) survives an
-        // overwrite of an older version.
-        let mut m = manifest(vec![entry("v2", "bb"), entry("v1", "aa")]);
-        m.upsert(entry("v1", "cc"));
+    fn upsert_moves_a_replaced_non_head_version_to_the_front() {
+        // Versioning suspended on a key that already has versioned entries: the
+        // PUT overwrites the null version *and* that null version becomes
+        // current. Leaving it in place would make `latest` report v3, a version
+        // the client just overwrote.
+        let mut m = manifest(vec![
+            entry("v3", "cc"),
+            entry("v2", "bb"),
+            entry("null", "aa"),
+        ]);
+        m.upsert(entry(NULL_VERSION_ID, "dd"));
+
         let ids: Vec<&str> = m.versions.iter().map(|e| e.version_id.as_str()).collect();
-        assert_eq!(ids, ["v2", "v1"]);
-        assert_eq!(m.versions[1].etag, "cc");
+        assert_eq!(ids, [NULL_VERSION_ID, "v3", "v2"]);
+        assert_eq!(m.latest().unwrap().etag, "dd");
+        assert_eq!(m.versions.len(), 3, "history grew on an overwrite");
     }
 
     #[test]
@@ -305,6 +330,35 @@ mod tests {
             .unwrap();
         let err = load_manifest(&p).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn load_manifest_refuses_a_newer_format() {
+        // Unknown fields deserialize away silently, so parsing a newer manifest
+        // and writing it back would drop them while keeping its format stamp.
+        // Refusing to read it is what stops that from happening quietly.
+        let guard = tempfile::tempdir().unwrap();
+        let p = guard.path().join("m.json");
+        tokio::fs::write(
+            &p,
+            br#"{"format":2,"versions":[],"retention":{"mode":"COMPLIANCE"}}"#,
+        )
+        .await
+        .unwrap();
+
+        let err = load_manifest(&p).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(
+            msg.contains('2') && msg.contains(&MANIFEST_FORMAT.to_string()),
+            "{msg}"
+        );
+
+        // Reject-newer only: an older stamp still reads.
+        tokio::fs::write(&p, br#"{"format":0,"versions":[]}"#)
+            .await
+            .unwrap();
+        assert_eq!(load_manifest(&p).await.unwrap().unwrap().format, 0);
     }
 
     #[tokio::test]
