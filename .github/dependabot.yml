@@ -1,0 +1,60 @@
+# Automated dependency updates.
+#
+# Every pull request in this repository is expected to link an issue, and
+# Dependabot cannot add that link itself. Issue #9 ("Dependabot bumps") is the
+# standing tracking issue for all of them: reference it when reviewing or
+# merging one of these pull requests.
+#
+# Grouping is here to keep the volume down. Anything that arrives ungrouped is
+# a major version move, which is the kind that wants to be read on its own.
+version: 2
+updates:
+  # The UBI base images in the Dockerfile are pinned by digest, so without this
+  # they would never move at all. A bump runs the container workflow, which
+  # means the smoke test is what decides whether the new base image ships.
+  # Both stages move together in one pull request: they are two halves of the
+  # same build and reviewing them apart gains nothing.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      base-images:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: chore
+
+  # The workflows pin actions by major tag, so most of what lands here is a
+  # major version move and will come as its own pull request regardless. The
+  # group catches the rest.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: chore
+
+  # Cargo.lock is committed and the build uses --locked, so a dependency only
+  # moves when a pull request moves it. Minor and patch updates are batched;
+  # majors arrive separately because they are the ones that break something.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: chore

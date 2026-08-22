@@ -13,7 +13,12 @@
 # ---------------------------------------------------------------------------
 # Stage 1: build the binary.
 # ---------------------------------------------------------------------------
-FROM registry.access.redhat.com/ubi9/ubi AS builder
+# Pinned by digest so that two builds of the same commit get the same base
+# image, and a Red Hat republish of the tag becomes a reviewable pull request
+# rather than a silent change. The digest is the manifest list's, not one
+# platform's, because this builds for both amd64 and arm64. Dependabot keeps
+# the pin current; see .github/dependabot.yml.
+FROM registry.access.redhat.com/ubi9/ubi:latest@sha256:5426a8f45e80a07168a30ea24d84f266094b3756624a5508cc53927e6ee39e09 AS builder
 
 # gcc links the binary. cmake, make and perl are for aws-lc-sys, the C crypto
 # backend rustls pulls in through tokio-rustls; it builds its own libcrypto
@@ -68,7 +73,9 @@ RUN mkdir -p /rootfs/data && chmod 0775 /rootfs/data
 # ---------------------------------------------------------------------------
 # Stage 2: the shipped image.
 # ---------------------------------------------------------------------------
-FROM registry.access.redhat.com/ubi9/ubi-micro
+# Digest-pinned for the same reasons as the builder stage above, and this one
+# matters more: it is the base of the image users actually pull.
+FROM registry.access.redhat.com/ubi9/ubi-micro:latest@sha256:7e7f79ab747bf2b452e3043dd89f388e92be4c7fdcc8b815b58adf6c99c39c95
 
 LABEL org.opencontainers.image.title="aks3" \
       org.opencontainers.image.description="Single-binary S3-compatible object store" \
