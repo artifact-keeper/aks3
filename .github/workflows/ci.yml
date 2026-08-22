@@ -6,7 +6,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Same version as rust-toolchain.toml, which is what cargo obeys inside
       # the checkout. Naming it here too is what keeps the action from
       # installing one compiler and the build from downloading another, and
@@ -26,7 +26,7 @@ jobs:
   compliance:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with: { toolchain: "1.98" }
       - uses: Swatinem/rust-cache@v2
