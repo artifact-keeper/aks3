@@ -62,11 +62,12 @@ address it bound before it accepts anything.
 
 ### Configuration
 
-`listen` defaults to `127.0.0.1:9000` and `data_dir` to `./data`. The root
+`listen` defaults to `127.0.0.1:9000`, `data_dir` to `./data`, and
+`shutdown_grace_seconds` to 8 (see [Stopping it](#stopping-it)). The root
 credentials have no default and have to be set, so the shortest config that
 works is those two lines on their own.
 
-Four environment variables override the file, which is what lets an image ship
+Five environment variables override the file, which is what lets an image ship
 a config and still take its credentials at run time:
 
 | Variable | Sets |
@@ -75,6 +76,7 @@ a config and still take its credentials at run time:
 | `AKS3_DATA_DIR` | `data_dir` |
 | `AKS3_ROOT_USER` | `root_access_key` |
 | `AKS3_ROOT_PASSWORD` | `root_secret_key` |
+| `AKS3_SHUTDOWN_GRACE` | `shutdown_grace_seconds` |
 
 With the credentials in the environment there is no need for a file at all:
 
@@ -191,19 +193,36 @@ Point the AWS CLI at it exactly as in [Talking to it](#talking-to-it), with
 
 `docker stop` asks with SIGTERM, as do a Kubernetes pod deletion and a systemd
 unit stop. aks3 treats it the same way it treats `Ctrl-C`: it stops accepting
-new connections and gives the ones already running up to eight seconds to
-finish before exiting 0, so a `GetObject` part way through its body is not cut
-off. A stop with nothing in flight takes a fraction of a second.
+new connections and gives the ones already running a window to finish in,
+eight seconds by default, before exiting 0, so a `GetObject` part way through
+its body is not cut off. A stop with nothing in flight takes a fraction of a
+second.
 
-Connections still open when those eight seconds are up are dropped, and the
-server says so in its log before it exits. Eight seconds is not configurable,
-and raising a supervisor's stop timeout does not lengthen it.
+Connections still open when the window is up are dropped, and the server says
+so in its log before it exits. Raising a supervisor's stop timeout does not
+lengthen the window; `shutdown_grace_seconds` does, up to a limit of 600:
 
-What the timeout does is protect it. Whatever sent the SIGTERM is counting down
-to a SIGKILL of its own, and if that lands first the drain is cut off part way
-through and the container reports exit code 137. `docker stop` allows ten
-seconds by default, which is enough, but it is worth setting rather than
-inheriting:
+```toml
+shutdown_grace_seconds = 25
+```
+
+```
+docker run -e AKS3_SHUTDOWN_GRACE=25 ...
+```
+
+Zero is allowed and means what it says: the drain runs, but nothing still open
+gets any time, so a stop never waits. That suits a deployment where clients
+retry and a fast rollout matters more than the request in flight. A value above
+600 is refused at startup rather than accepted, on the grounds that it is more
+likely a typo than a plan, and a drain that outlasts every supervisor's patience
+would turn every stop into a SIGKILL.
+
+Whatever the window is, the supervisor's timeout has to exceed it. The thing that
+sent the SIGTERM is counting down to a SIGKILL of its own, and if that lands
+first the drain is cut off part way through and the container reports exit code
+137.
+`docker stop` allows ten seconds by default, which is enough for the eight second
+default here, but it is worth setting rather than inheriting:
 
 ```
 docker stop -t 30 aks3
@@ -216,8 +235,9 @@ services:
 ```
 
 Kubernetes allows thirty seconds by default (`terminationGracePeriodSeconds`),
-and systemd ninety (`TimeoutStopSec`), so neither needs changing. Anything set
-below eight seconds does need changing, or every stop ends in a SIGKILL.
+and systemd ninety (`TimeoutStopSec`), so neither needs changing for the default
+window. Raise them alongside `shutdown_grace_seconds` if you raise it, and lower
+`shutdown_grace_seconds` if a supervisor allows less than eight seconds.
 
 ### What is in the image
 

@@ -6,7 +6,7 @@
 //! The `aks3` binary: read the settings, start the server, log why not.
 
 use aks3_server::config::Config;
-use aks3_server::serve;
+use aks3_server::serve::{self, ShutdownSignals};
 
 /// The only flag the binary takes.
 const CONFIG_FLAG: &str = "--config";
@@ -16,6 +16,14 @@ const USAGE: &str = "usage: aks3 [--config <path>]";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // First, before anything that can be slow or can fail. A container is
+    // stoppable from the moment it starts, and reading a config file or
+    // sweeping a large store's temp directory is time in which a SIGTERM with
+    // no handler installed is discarded rather than held: the process would
+    // keep running until its supervisor gave up and sent SIGKILL. Registering
+    // here costs nothing if the process goes on to exit on a bad config.
+    let signals = ShutdownSignals::install()?;
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -29,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     // Nobody is waiting to be told the address; the log line in `run` is the
     // announcement.
     let (bound, _) = tokio::sync::oneshot::channel();
-    serve::run(config, bound).await
+    serve::run(config, bound, signals.recv()).await
 }
 
 /// Pulls `--config <path>` out of the command line.
