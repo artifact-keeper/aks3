@@ -1,0 +1,23 @@
+# Findings the container image scan is told to let past.
+#
+# The gate in .github/workflows/container.yml already ignores anything with no
+# fix released, so an entry here is for the narrower and more awkward case:
+# upstream has shipped a fix and we are knowingly publishing without it. That
+# is a decision, and a decision wants a reason someone can disagree with.
+#
+# Every entry gives all three fields:
+#
+#   vulnerabilities:
+#     - id: CVE-2026-00000
+#       statement: why this is acceptable here, and what would change that
+#       expired_at: 2026-06-01
+#
+# expired_at is the part that matters. On that date the entry stops suppressing
+# and the gate fails on the finding again, which is the intended behaviour: an
+# exception has to be renewed by someone who still agrees with it rather than
+# outliving the reason it was granted. Months away, not years.
+#
+# The workflow names this file explicitly, because trivy picks up a plain
+# .trivyignore on its own but not the YAML form, and the YAML form is the one
+# that understands expiry dates.
+vulnerabilities: []

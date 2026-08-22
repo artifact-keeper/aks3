@@ -3,20 +3,22 @@ name: container
 # Builds ghcr.io/artifact-keeper/aks3, and publishes it from main and release
 # tags.
 #
-# Pull requests run the build and the smoke gate but touch the registry not at
-# all: the steps that need a writable token are skipped, because a pull request
-# from a fork is given a read-only one and the login alone would fail. What is
-# left still answers the question a pull request asks, which is whether this
-# change produces an image that works.
+# Pull requests run the build, the smoke gate and the vulnerability gate but
+# touch the registry not at all: the steps that need a writable token are
+# skipped, because a pull request from a fork is given a read-only one and the
+# login alone would fail. What is left still answers the question a pull
+# request asks, which is whether this change produces an image that works and
+# is fit to publish.
 on:
   pull_request:
   push:
     branches: [main]
     tags: ["v*"]
 
+# Granted per job rather than here, so the merge job never holds the
+# code-scanning write that only the build job has any use for.
 permissions:
   contents: read
-  packages: write
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
@@ -38,6 +40,10 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
     steps:
       - uses: actions/checkout@v4
 
@@ -99,6 +105,99 @@ jobs:
       - name: Smoke test
         run: tests/container/smoke.sh aks3:candidate
 
+      # -----------------------------------------------------------------
+      # The vulnerability policy, and why it is drawn here rather than
+      # somewhere stricter.
+      #
+      # Blocks the push: CRITICAL or HIGH that upstream has already fixed.
+      # Those are the findings someone can act on the same day, by taking a
+      # newer base image or a newer dependency, so an image carrying one has
+      # no business being published.
+      #
+      # Reported but does not block: everything with no fix released yet, at
+      # any severity, plus everything at MEDIUM and below. ubi-micro's
+      # packages are Red Hat's to fix, and failing on an unfixed one would
+      # park every merge in the repository behind a release nobody here can
+      # make. A gate that blocks on work you cannot do is a gate that gets
+      # switched off, so these go to code scanning and the job summary
+      # instead, where they are visible and have a history.
+      #
+      # A finding that is fixed upstream but deliberately not being taken
+      # goes in .trivyignore.yaml, which asks for a reason and an expiry date
+      # on every entry. The expiry is the point: an exception has to be
+      # renewed on purpose rather than outliving the reason for it.
+      #
+      # Scope is the OS packages, which is all a scan of this image can see.
+      # The Rust dependencies are cargo-deny's job in ci.yml, which reads
+      # Cargo.lock and so sees the whole tree rather than what survived into
+      # a stripped binary. Neither covers the other, and both run.
+      # -----------------------------------------------------------------
+      #
+      # This first pass takes everything and fails on nothing: it is the
+      # record, and the gate below is the decision. Its output goes under
+      # runner.temp rather than the workspace, so neither it nor the SARIF
+      # derived from it joins the build context that the push sends to the
+      # daemon.
+      - name: Scan the image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: aks3:candidate
+          scanners: vuln
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          format: json
+          output: ${{ runner.temp }}/trivy-report.json
+          exit-code: "0"
+
+      - name: Summarise what the scan found
+        env:
+          ARCH: ${{ matrix.arch }}
+          REPORT: ${{ runner.temp }}/trivy-report.json
+          SARIF: ${{ runner.temp }}/trivy-results.sarif
+        run: |
+          trivy convert --format sarif --output "$SARIF" "$REPORT"
+          {
+            echo "### Image vulnerabilities: ${ARCH}"
+            echo
+            echo "| Severity | Found | Fixed upstream |"
+            echo "| --- | ---: | ---: |"
+            jq -r '
+              [.Results[]?.Vulnerabilities[]?] as $all
+              | ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"][]
+              | . as $sev
+              | [$all[] | select(.Severity == $sev)] as $found
+              | [$found[] | select((.FixedVersion // "") != "")] as $fixed
+              | "| \($sev) | \($found | length) | \($fixed | length) |"
+            ' "$REPORT"
+            echo
+            echo "The right-hand column is what the gate blocks on, at CRITICAL and HIGH."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Skipped for a pull request from a fork, which is handed a read-only
+      # token and cannot write security events. The gate below still runs
+      # there, so a fork's pull request is checked, just not recorded.
+      - name: Publish the report to code scanning
+        if: github.event.pull_request.head.repo.fork != true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ runner.temp }}/trivy-results.sarif
+          # Distinct per architecture, or the two jobs would each overwrite
+          # the other's results under one category and only the loser's
+          # findings would survive.
+          category: trivy-${{ matrix.arch }}
+
+      - name: Vulnerability gate
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: aks3:candidate
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          # Named explicitly: trivy reads a plain .trivyignore on its own but
+          # not the YAML form, and the YAML form is the one with expiry dates.
+          trivyignores: .trivyignore.yaml
+          exit-code: "1"
+          format: table
+
       # The same build again, which the layer cache makes close to free, this
       # time as a push of an untagged manifest. Tags are applied once, by the
       # merge job, so no tag ever points at a half-published set of platforms.
@@ -136,6 +235,9 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/download-artifact@v4
         with:
