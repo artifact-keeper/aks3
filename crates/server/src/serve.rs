@@ -9,9 +9,15 @@
 //! the service that speaks S3, the auth provider that decides whose request it
 //! is), binds a listener, and hands each connection to `hyper`. Nothing in this
 //! module knows what an S3 operation is.
+//!
+//! What stops the server is the caller's to decide. [`run`] takes the trigger
+//! as a future; the binary builds one from [`ShutdownSignals`], and anything
+//! embedding the server picks its own.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,20 +38,6 @@ use aks3_iam::{IamAuth, RootCredentials};
 use s3s::service::{S3Service, S3ServiceBuilder};
 
 use crate::config::{Config, TlsConfig};
-
-/// How long a shutdown waits for connections that are still in flight before
-/// dropping them. A `GET` of a large object is a long-lived connection, so this
-/// is generous enough to let one finish rather than tuned for a fast exit.
-///
-/// It has to stay under the timeout of whatever sent the signal, because that
-/// timeout ends in SIGKILL. `docker stop` waits ten seconds by default, so a
-/// ten second window here would be a tie, and a tie is lost: the drain is still
-/// deciding when the process is killed under it, which is the outcome the drain
-/// exists to avoid. Eight seconds leaves the margin that makes the common case
-/// resolve on the server's terms. Anything still open when it expires is
-/// dropped, so raising a supervisor's timeout protects this window rather than
-/// lengthening it.
-const GRACE_PERIOD: Duration = Duration::from_secs(8);
 
 /// How long the accept loop waits after a failed `accept` before trying again.
 ///
@@ -74,24 +66,28 @@ enum Transport {
     Tls(TlsAcceptor),
 }
 
-/// Runs the server until SIGINT or SIGTERM arrives, then drains.
+/// Runs the server until `shutdown` resolves, then drains.
+///
+/// `shutdown` is the caller's stop button, and what it resolves to is the name
+/// this server logs as the reason. The binary passes [`ShutdownSignals::recv`],
+/// so a stop there means SIGINT or SIGTERM; a caller embedding the server has
+/// no signal handler forced on it and passes whatever it stops on, down to
+/// `std::future::pending()` for a server that only ends when its task is
+/// dropped.
 ///
 /// The bound address is sent on `bound` before the first connection is
 /// accepted, which is how a caller that asked for port 0 learns which port it
 /// got. A caller that does not care can drop the receiver.
 ///
-/// Errors if the signal handlers cannot be installed, the store cannot be
-/// opened, the root credentials are rejected, the TLS material is unusable, or
-/// the listen address cannot be bound. An error after that point belongs to one
-/// connection and is logged, not returned: a client that hangs up mid-request
-/// does not stop the server.
-pub async fn run(cfg: Config, bound: oneshot::Sender<SocketAddr>) -> anyhow::Result<()> {
-    // Before anything slow, so that a stop request arriving during startup is
-    // held rather than lost. Opening a large store sweeps its temp directory,
-    // and a container told to stop in that window has no handler to catch the
-    // SIGTERM yet if this waits until the accept loop.
-    let signals = ShutdownSignals::install()?;
-
+/// Errors if the store cannot be opened, the root credentials are rejected, the
+/// TLS material is unusable, or the listen address cannot be bound. An error
+/// after that point belongs to one connection and is logged, not returned: a
+/// client that hangs up mid-request does not stop the server.
+pub async fn run(
+    cfg: Config,
+    bound: oneshot::Sender<SocketAddr>,
+    shutdown: impl Future<Output = &'static str> + Send,
+) -> anyhow::Result<()> {
     let engine = FsEngine::open(&cfg.data_dir)
         .await
         .with_context(|| format!("opening the store at {}", cfg.data_dir.display()))?;
@@ -127,19 +123,32 @@ pub async fn run(cfg: Config, bound: oneshot::Sender<SocketAddr>) -> anyhow::Res
     // The receiver is optional; a caller that already knows the address drops it.
     let _ = bound.send(addr);
 
-    accept_loop(listener, transport, service, signals).await;
+    accept_loop(
+        listener,
+        transport,
+        service,
+        shutdown,
+        Duration::from_secs(cfg.shutdown_grace_seconds),
+    )
+    .await;
     Ok(())
 }
 
-/// Accepts connections until a shutdown signal arrives, then waits out
-/// [`GRACE_PERIOD`] for the ones still running.
+/// Accepts connections until `shutdown` resolves, then waits up to `grace` for
+/// the ones still running.
 async fn accept_loop(
     listener: TcpListener,
     transport: Transport,
     service: S3Service,
-    mut signals: ShutdownSignals,
+    shutdown: impl Future<Output = &'static str>,
+    grace: Duration,
 ) {
     let graceful = GracefulShutdown::new();
+    // Pinned once and polled by reference, so that a pass through the loop that
+    // an incoming connection wins leaves the trigger's progress intact rather
+    // than starting it over. A `select!` on `&mut` does not drop the future it
+    // does not finish.
+    let mut shutdown = pin!(shutdown);
 
     loop {
         let stream = tokio::select! {
@@ -154,14 +163,14 @@ async fn accept_loop(
                 // pause is unconditional because the error alone does not say
                 // whether the cause has gone away; see ACCEPT_ERROR_BACKOFF.
                 // It delays a shutdown by at most one backoff, since the next
-                // pass through the loop selects on the signal again.
+                // pass through the loop selects on the trigger again.
                 Err(err) => {
                     tracing::warn!("accept failed: {err}");
                     tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                     continue;
                 }
             },
-            name = signals.recv() => {
+            name = &mut shutdown => {
                 tracing::info!("received {name}, draining connections");
                 break;
             }
@@ -175,15 +184,32 @@ async fn accept_loop(
         ));
     }
 
-    tokio::select! {
-        () = graceful.shutdown() => tracing::info!("all connections closed"),
-        () = tokio::time::sleep(GRACE_PERIOD) => {
-            tracing::warn!("connections still open after {GRACE_PERIOD:?}, exiting anyway");
-        }
+    // `timeout` polls the drain before it looks at the clock, so a grace period
+    // of zero normally still reports the truth: connections already finished are
+    // closed rather than described as dropped. Only normally, because a task
+    // that has spent its cooperative budget yields `Pending` without doing the
+    // work, so a zero window under sustained load can still take the warning
+    // branch with nothing open. The line is then misleading rather than wrong,
+    // and the exit is the same either way.
+    if tokio::time::timeout(grace, graceful.shutdown())
+        .await
+        .is_ok()
+    {
+        tracing::info!("all connections closed");
+    } else {
+        tracing::warn!("connections still open after {grace:?}, exiting anyway");
     }
 }
 
-/// The two signals that ask this server to stop.
+/// The two signals that ask this server to stop, as a shutdown trigger for
+/// [`run`].
+///
+/// Handlers are process-wide, which is why installing them is the caller's
+/// decision rather than something [`run`] does: the binary wants them, and an
+/// in-process caller (the tests, or anything embedding this server in a larger
+/// program) would have its own signal handling taken over without asking. The
+/// binary installs them as its first act, before it reads any settings, so
+/// there is no window at startup in which a stop request is discarded.
 ///
 /// SIGINT is `Ctrl-C` at a terminal. SIGTERM is what everything else uses:
 /// `docker stop`, a Kubernetes pod deletion and `systemctl stop` all send it
@@ -197,7 +223,7 @@ async fn accept_loop(
 ///
 /// `tokio::signal::unix` limits this to Unix, which the rest of the server
 /// already requires (see `aks3_engine::atomic`).
-struct ShutdownSignals {
+pub struct ShutdownSignals {
     interrupt: Signal,
     terminate: Signal,
 }
@@ -209,7 +235,7 @@ impl ShutdownSignals {
     /// warning: a server nobody can ask to stop is one an operator can only
     /// kill, and finding that out at startup beats finding it out during a
     /// deploy.
-    fn install() -> anyhow::Result<Self> {
+    pub fn install() -> anyhow::Result<Self> {
         Ok(Self {
             interrupt: signal(SignalKind::interrupt()).context("listening for SIGINT")?,
             terminate: signal(SignalKind::terminate()).context("listening for SIGTERM")?,
@@ -218,10 +244,14 @@ impl ShutdownSignals {
 
     /// Resolves at whichever arrives first, naming it for the log.
     ///
+    /// Takes `self` by value because this is a stop button rather than a
+    /// stream: it is handed to [`run`] once and the server does not outlive it
+    /// resolving.
+    ///
     /// Cancel-safe, which is what lets the accept loop select on it: a signal
     /// that has not arrived yet is not consumed by a poll that loses the race
     /// to an incoming connection.
-    async fn recv(&mut self) -> &'static str {
+    pub async fn recv(mut self) -> &'static str {
         tokio::select! {
             _ = self.interrupt.recv() => "SIGINT",
             _ = self.terminate.recv() => "SIGTERM",

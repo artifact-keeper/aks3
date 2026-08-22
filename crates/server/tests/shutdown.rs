@@ -23,9 +23,9 @@ const LOG_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the child gets to exit once it has been signalled.
 ///
 /// Far above the near-instant exit expected of a server holding no connections,
-/// and above the eight second grace period it would wait out even if it thought
-/// it held one, so reaching this means the signal was ignored rather than that
-/// the machine was busy.
+/// and above the eight second grace period it would wait out by default even if
+/// it thought it held one, so reaching this means the signal was ignored rather
+/// than that the machine was busy.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How often the child is checked for having exited.
@@ -44,8 +44,15 @@ impl Server {
     /// Starts the binary this crate builds over a fresh store, on a port the
     /// operating system picks, and returns once it says it is listening.
     fn start() -> Self {
+        Self::start_with(&[])
+    }
+
+    /// [`Server::start`] with `extra` added to the child's environment, for the
+    /// settings a test wants to vary.
+    fn start_with(extra: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().expect("a scratch directory");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_aks3"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_aks3"));
+        command
             .env("AKS3_LISTEN", "127.0.0.1:0")
             .env("AKS3_DATA_DIR", dir.path())
             .env("AKS3_ROOT_USER", "shutdowntest")
@@ -54,9 +61,11 @@ impl Server {
             // The logs are the assertion, and `tracing_subscriber::fmt` writes
             // them to stdout. stderr is left inherited so that a panic in the
             // child shows up in the test output.
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("starting the aks3 binary");
+            .stdout(Stdio::piped());
+        for (name, value) in extra {
+            command.env(name, value);
+        }
+        let mut child = command.spawn().expect("starting the aks3 binary");
 
         // Drained by a thread rather than read on demand, because a pipe left
         // unread fills and blocks the child, and the child has to stay free to
@@ -181,4 +190,44 @@ fn sigint_drains_and_exits_cleanly() {
         "SIGINT left exit status {status}\n{}",
         server.log()
     );
+}
+
+/// A grace period of zero is a documented setting rather than a broken one: it
+/// asks for whatever is still open to be dropped at once. The drain still runs,
+/// and a server holding nothing still reports a clean close rather than a
+/// warning about connections it does not have.
+#[test]
+fn a_zero_grace_period_still_stops_cleanly() {
+    let mut server = Server::start_with(&[("AKS3_SHUTDOWN_GRACE", "0")]);
+    let status = server.signal("-TERM");
+
+    server.wait_for("received SIGTERM, draining connections");
+    server.wait_for("all connections closed");
+    assert!(
+        status.success(),
+        "SIGTERM left exit status {status}\n{}",
+        server.log()
+    );
+}
+
+/// The bound on the grace period is enforced where an operator finds out about
+/// it in time to fix it, which is the startup that reads the setting rather
+/// than the stop weeks later that would have hung on it.
+#[test]
+fn a_grace_period_past_the_bound_stops_the_server_at_startup() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let output = Command::new(env!("CARGO_BIN_EXE_aks3"))
+        .env("AKS3_LISTEN", "127.0.0.1:0")
+        .env("AKS3_DATA_DIR", dir.path())
+        .env("AKS3_ROOT_USER", "shutdowntest")
+        .env("AKS3_ROOT_PASSWORD", "shutdowntestsecret")
+        .env("AKS3_SHUTDOWN_GRACE", "601")
+        .output()
+        .expect("starting the aks3 binary");
+
+    assert!(!output.status.success(), "the server started anyway");
+    // The message has to name the setting, because the value came from an
+    // environment variable whose name is not the setting's.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("shutdown_grace_seconds"), "{stderr}");
 }

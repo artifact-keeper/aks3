@@ -24,6 +24,32 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:9000";
 /// working directory.
 const DEFAULT_DATA_DIR: &str = "./data";
 
+/// How long a shutdown waits for connections that are still in flight before
+/// dropping them, when nothing says otherwise.
+///
+/// A `GET` of a large object is a long-lived connection, so this is generous
+/// enough to let one finish rather than tuned for a fast exit. It has to stay
+/// under the timeout of whatever sent the signal, because that timeout ends in
+/// SIGKILL. `docker stop` waits ten seconds by default, so a ten second window
+/// here would be a tie, and a tie is lost: the drain is still deciding when the
+/// process is killed under it, which is the outcome the drain exists to avoid.
+/// Eight seconds leaves the margin that makes the common case resolve on the
+/// server's terms under a supervisor nobody has configured.
+const DEFAULT_SHUTDOWN_GRACE_SECONDS: u64 = 8;
+
+/// The longest drain window this server will start with.
+///
+/// Ten minutes is past anything a supervisor allows without being told to (a
+/// systemd unit stops at ninety seconds, Kubernetes at thirty), so a value
+/// above it is far more likely to be a typo (an extra zero, or milliseconds
+/// written where seconds were asked for) than a request. Left unchecked, such a
+/// value costs nothing at startup and everything at the stop weeks later, where
+/// it turns into a drain that never finishes and a SIGKILL every time. The
+/// bound is arbitrary in the sense that no mechanism breaks at 601; it is there
+/// so the mistake is reported by the process that will suffer from it, while
+/// somebody is still watching.
+const MAX_SHUTDOWN_GRACE_SECONDS: u64 = 600;
+
 /// Environment variable naming the listen address.
 pub const ENV_LISTEN: &str = "AKS3_LISTEN";
 /// Environment variable naming the data directory.
@@ -32,6 +58,8 @@ pub const ENV_DATA_DIR: &str = "AKS3_DATA_DIR";
 pub const ENV_ROOT_USER: &str = "AKS3_ROOT_USER";
 /// Environment variable naming the root secret key.
 pub const ENV_ROOT_PASSWORD: &str = "AKS3_ROOT_PASSWORD";
+/// Environment variable naming the shutdown grace period, in seconds.
+pub const ENV_SHUTDOWN_GRACE: &str = "AKS3_SHUTDOWN_GRACE";
 
 /// Reasons the server cannot work out what to start as.
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +84,25 @@ pub enum ConfigError {
     /// environment. Carries the environment variable that would supply it.
     #[error("missing required setting; set it in the config file or as {0}")]
     Missing(&'static str),
+    /// A setting was given a value the server cannot start with. Separate from
+    /// [`ConfigError::Parse`] because the file parser only knows the TOML
+    /// types: a whole number where a whole number belongs is a valid file and
+    /// still an unusable setting, and the environment carries strings, so it
+    /// gets no type check at all.
+    ///
+    /// The value is quoted in the message, so that a variable set to nothing at
+    /// all reads as `""` rather than as a gap the reader has to guess the width
+    /// of. That is not a rare case: Compose passes an empty string for
+    /// `VAR=${UNSET}`.
+    #[error("{setting} = {value:?} is not usable; it has to be {expected}")]
+    Invalid {
+        /// The setting's name in the config file.
+        setting: &'static str,
+        /// The value as it was written.
+        value: String,
+        /// What would have been accepted, as a phrase completing the message.
+        expected: &'static str,
+    },
 }
 
 /// TLS material, as paths to PEM files on disk.
@@ -81,6 +128,9 @@ pub struct Config {
     pub root_access_key: String,
     /// Root secret key. Never log this; see the [`fmt::Debug`] impl.
     pub root_secret_key: String,
+    /// How many seconds a shutdown gives the connections still in flight to
+    /// finish before dropping them. Zero drops them at once.
+    pub shutdown_grace_seconds: u64,
     /// TLS material, or `None` to serve plain HTTP.
     pub tls: Option<TlsConfig>,
 }
@@ -98,6 +148,7 @@ struct FileConfig {
     data_dir: Option<PathBuf>,
     root_access_key: Option<String>,
     root_secret_key: Option<String>,
+    shutdown_grace_seconds: Option<u64>,
     tls: Option<TlsConfig>,
 }
 
@@ -148,9 +199,50 @@ impl Config {
             root_secret_key: env(ENV_ROOT_PASSWORD)
                 .or(file.root_secret_key)
                 .ok_or(ConfigError::Missing(ENV_ROOT_PASSWORD))?,
+            shutdown_grace_seconds: shutdown_grace_seconds(
+                env(ENV_SHUTDOWN_GRACE).as_deref(),
+                file.shutdown_grace_seconds,
+            )?,
             tls: file.tls,
         })
     }
+}
+
+/// Settles the drain window from the two sources and checks it is one the
+/// server can start with.
+///
+/// The environment arrives as text because that is all an environment holds, so
+/// this is where a value that is not a number is caught; the file is already
+/// known to hold a whole number, having parsed as one, and only the bound is
+/// left to check.
+fn shutdown_grace_seconds(
+    from_env: Option<&str>,
+    from_file: Option<u64>,
+) -> Result<u64, ConfigError> {
+    /// The name to report either source under, which is the file's key: an
+    /// operator who set the environment variable knows which one they set,
+    /// and one who set neither is being pointed at the file.
+    const SETTING: &str = "shutdown_grace_seconds";
+    /// Completes "it has to be ..." in the error.
+    const EXPECTED: &str = "a whole number of seconds, at most 600";
+
+    let seconds = match from_env {
+        Some(text) => text.parse::<u64>().map_err(|_| ConfigError::Invalid {
+            setting: SETTING,
+            value: text.to_owned(),
+            expected: EXPECTED,
+        })?,
+        None => from_file.unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECONDS),
+    };
+
+    if seconds > MAX_SHUTDOWN_GRACE_SECONDS {
+        return Err(ConfigError::Invalid {
+            setting: SETTING,
+            value: seconds.to_string(),
+            expected: EXPECTED,
+        });
+    }
+    Ok(seconds)
 }
 
 /// Written by hand so the root secret cannot reach a log through a `{:?}` on
@@ -162,6 +254,7 @@ impl fmt::Debug for Config {
             .field("data_dir", &self.data_dir)
             .field("root_access_key", &self.root_access_key)
             .field("root_secret_key", &"[REDACTED]")
+            .field("shutdown_grace_seconds", &self.shutdown_grace_seconds)
             .field("tls", &self.tls)
             .finish()
     }
@@ -169,7 +262,10 @@ impl fmt::Debug for Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ConfigError, ENV_DATA_DIR, ENV_LISTEN, ENV_ROOT_PASSWORD, ENV_ROOT_USER};
+    use super::{
+        Config, ConfigError, ENV_DATA_DIR, ENV_LISTEN, ENV_ROOT_PASSWORD, ENV_ROOT_USER,
+        ENV_SHUTDOWN_GRACE,
+    };
 
     /// A config file with every setting the server needs.
     const FULL_TOML: &str = r#"
@@ -272,6 +368,142 @@ mod tests {
         ));
     }
 
+    /// The drain window has a default, so a config written before the setting
+    /// existed keeps the behaviour it had.
+    #[test]
+    fn the_grace_period_defaults_to_eight_seconds() {
+        let env = [
+            (ENV_ROOT_USER, "admin"),
+            (ENV_ROOT_PASSWORD, "secretpassword"),
+        ];
+        let c = Config::load_from(None, stub_env(&env)).unwrap();
+        assert_eq!(c.shutdown_grace_seconds, 8);
+    }
+
+    #[test]
+    fn the_grace_period_comes_from_the_file() {
+        let (_dir, path) = config_file(
+            r#"
+            root_access_key = "admin"
+            root_secret_key = "secretpassword"
+            shutdown_grace_seconds = 25
+            "#,
+        );
+        let c = Config::load_from(Some(&path), stub_env(&[])).unwrap();
+        assert_eq!(c.shutdown_grace_seconds, 25);
+    }
+
+    #[test]
+    fn the_grace_period_in_the_environment_wins_over_the_file() {
+        let (_dir, path) = config_file(
+            r#"
+            root_access_key = "admin"
+            root_secret_key = "secretpassword"
+            shutdown_grace_seconds = 25
+            "#,
+        );
+        let env = [(ENV_SHUTDOWN_GRACE, "40")];
+        let c = Config::load_from(Some(&path), stub_env(&env)).unwrap();
+        assert_eq!(c.shutdown_grace_seconds, 40);
+    }
+
+    /// Zero is a real answer, not a mistake: it asks for the connections still
+    /// open at a stop to be dropped rather than waited for.
+    #[test]
+    fn a_zero_grace_period_is_accepted() {
+        let env = [
+            (ENV_ROOT_USER, "admin"),
+            (ENV_ROOT_PASSWORD, "secretpassword"),
+            (ENV_SHUTDOWN_GRACE, "0"),
+        ];
+        let c = Config::load_from(None, stub_env(&env)).unwrap();
+        assert_eq!(c.shutdown_grace_seconds, 0);
+    }
+
+    /// An environment variable is a string, so this is the one source that can
+    /// carry something that is not a number at all.
+    #[test]
+    fn a_grace_period_that_is_not_a_number_is_an_error() {
+        let env = [
+            (ENV_ROOT_USER, "admin"),
+            (ENV_ROOT_PASSWORD, "secretpassword"),
+            (ENV_SHUTDOWN_GRACE, "eight"),
+        ];
+        let err = Config::load_from(None, stub_env(&env)).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+        assert!(err.to_string().contains("eight"), "{err}");
+    }
+
+    /// A variable set to nothing at all is the case Compose produces from
+    /// `VAR=${UNSET}`, and the message has to show the emptiness rather than
+    /// trail off into a blank.
+    #[test]
+    fn an_empty_grace_period_is_an_error_that_shows_it_was_empty() {
+        let env = [
+            (ENV_ROOT_USER, "admin"),
+            (ENV_ROOT_PASSWORD, "secretpassword"),
+            (ENV_SHUTDOWN_GRACE, ""),
+        ];
+        let err = Config::load_from(None, stub_env(&env)).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+        assert!(err.to_string().contains(r#"= """#), "{err}");
+    }
+
+    /// A negative number is not a parse error the caller can be left to guess
+    /// at either: it is rejected the same way, naming what was written.
+    #[test]
+    fn a_negative_grace_period_is_an_error() {
+        let env = [
+            (ENV_ROOT_USER, "admin"),
+            (ENV_ROOT_PASSWORD, "secretpassword"),
+            (ENV_SHUTDOWN_GRACE, "-1"),
+        ];
+        assert!(matches!(
+            Config::load_from(None, stub_env(&env)),
+            Err(ConfigError::Invalid { .. })
+        ));
+    }
+
+    /// The cap catches the mistyped value (a millisecond figure, an extra
+    /// zero) that would otherwise turn every stop into the supervisor's
+    /// SIGKILL. It applies wherever the value came from.
+    #[test]
+    fn a_grace_period_above_the_cap_is_an_error_from_either_source() {
+        let env = [
+            (ENV_ROOT_USER, "admin"),
+            (ENV_ROOT_PASSWORD, "secretpassword"),
+            (ENV_SHUTDOWN_GRACE, "601"),
+        ];
+        assert!(matches!(
+            Config::load_from(None, stub_env(&env)),
+            Err(ConfigError::Invalid { .. })
+        ));
+
+        let (_dir, path) = config_file(
+            r#"
+            root_access_key = "admin"
+            root_secret_key = "secretpassword"
+            shutdown_grace_seconds = 8000
+            "#,
+        );
+        assert!(matches!(
+            Config::load_from(Some(&path), stub_env(&[])),
+            Err(ConfigError::Invalid { .. })
+        ));
+    }
+
+    /// The bound itself is allowed; only what is past it is not.
+    #[test]
+    fn the_cap_itself_is_accepted() {
+        let env = [
+            (ENV_ROOT_USER, "admin"),
+            (ENV_ROOT_PASSWORD, "secretpassword"),
+            (ENV_SHUTDOWN_GRACE, "600"),
+        ];
+        let c = Config::load_from(None, stub_env(&env)).unwrap();
+        assert_eq!(c.shutdown_grace_seconds, 600);
+    }
+
     #[test]
     fn tls_paths_come_from_the_file() {
         let (_dir, path) = config_file(
@@ -331,7 +563,13 @@ mod tests {
             let guard = LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let names = [ENV_LISTEN, ENV_DATA_DIR, ENV_ROOT_USER, ENV_ROOT_PASSWORD];
+            let names = [
+                ENV_LISTEN,
+                ENV_DATA_DIR,
+                ENV_ROOT_USER,
+                ENV_ROOT_PASSWORD,
+                ENV_SHUTDOWN_GRACE,
+            ];
             let saved = names
                 .iter()
                 .map(|name| (*name, std::env::var(name).ok()))

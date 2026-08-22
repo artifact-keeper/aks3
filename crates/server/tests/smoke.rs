@@ -32,6 +32,12 @@ fn body_len() -> i64 {
 ///
 /// The returned directory owns the store and must be kept alive for as long as
 /// the server is wanted; the server task ends with the test.
+///
+/// The shutdown trigger is `pending`, so these servers stop by having their
+/// task dropped and nothing here installs a signal handler. That matters
+/// beyond tidiness: handlers are process-wide, and a test binary that
+/// installed them would swallow the SIGINT a developer sends to stop a
+/// `cargo test` that is taking too long.
 async fn start() -> (tempfile::TempDir, SocketAddr) {
     let dir = tempfile::tempdir().unwrap();
     let cfg = aks3_server::config::Config {
@@ -39,10 +45,15 @@ async fn start() -> (tempfile::TempDir, SocketAddr) {
         data_dir: dir.path().to_path_buf(),
         root_access_key: ACCESS_KEY.into(),
         root_secret_key: SECRET_KEY.into(),
+        shutdown_grace_seconds: 8,
         tls: None,
     };
     let (tx, rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move { aks3_server::serve::run(cfg, tx).await.unwrap() });
+    tokio::spawn(async move {
+        aks3_server::serve::run(cfg, tx, std::future::pending())
+            .await
+            .unwrap();
+    });
     // `run` sends the address once it is bound, so there is no sleep here and
     // no race: the client cannot connect before this resolves.
     (dir, rx.await.unwrap())
