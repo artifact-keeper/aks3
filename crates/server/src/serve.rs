@@ -185,8 +185,12 @@ async fn accept_loop(
     }
 
     // `timeout` polls the drain before it looks at the clock, so a grace period
-    // of zero still reports the truth: connections already finished are closed
-    // rather than described as dropped.
+    // of zero normally still reports the truth: connections already finished are
+    // closed rather than described as dropped. Only normally, because a task
+    // that has spent its cooperative budget yields `Pending` without doing the
+    // work, so a zero window under sustained load can still take the warning
+    // branch with nothing open. The line is then misleading rather than wrong,
+    // and the exit is the same either way.
     if tokio::time::timeout(grace, graceful.shutdown())
         .await
         .is_ok()

@@ -210,6 +210,11 @@ shutdown_grace_seconds = 25
 docker run -e AKS3_SHUTDOWN_GRACE=25 ...
 ```
 
+Once the drain has started, a second Ctrl-C or SIGTERM does not cut it short.
+The same handler catches it and the window runs to its end, so the way to stop
+early is the SIGKILL at the end of the supervisor's own timeout. That is worth
+knowing before setting a window of minutes rather than seconds.
+
 Zero is allowed and means what it says: the drain runs, but nothing still open
 gets any time, so a stop never waits. That suits a deployment where clients
 retry and a fast rollout matters more than the request in flight. A value above

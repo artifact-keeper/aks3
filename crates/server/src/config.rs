@@ -89,7 +89,12 @@ pub enum ConfigError {
     /// types: a whole number where a whole number belongs is a valid file and
     /// still an unusable setting, and the environment carries strings, so it
     /// gets no type check at all.
-    #[error("{setting} = {value} is not usable; it has to be {expected}")]
+    ///
+    /// The value is quoted in the message, so that a variable set to nothing at
+    /// all reads as `""` rather than as a gap the reader has to guess the width
+    /// of. That is not a rare case: Compose passes an empty string for
+    /// `VAR=${UNSET}`.
+    #[error("{setting} = {value:?} is not usable; it has to be {expected}")]
     Invalid {
         /// The setting's name in the config file.
         setting: &'static str,
@@ -427,6 +432,21 @@ mod tests {
         let err = Config::load_from(None, stub_env(&env)).unwrap_err();
         assert!(matches!(err, ConfigError::Invalid { .. }));
         assert!(err.to_string().contains("eight"), "{err}");
+    }
+
+    /// A variable set to nothing at all is the case Compose produces from
+    /// `VAR=${UNSET}`, and the message has to show the emptiness rather than
+    /// trail off into a blank.
+    #[test]
+    fn an_empty_grace_period_is_an_error_that_shows_it_was_empty() {
+        let env = [
+            (ENV_ROOT_USER, "admin"),
+            (ENV_ROOT_PASSWORD, "secretpassword"),
+            (ENV_SHUTDOWN_GRACE, ""),
+        ];
+        let err = Config::load_from(None, stub_env(&env)).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+        assert!(err.to_string().contains(r#"= """#), "{err}");
     }
 
     /// A negative number is not a parse error the caller can be left to guess
