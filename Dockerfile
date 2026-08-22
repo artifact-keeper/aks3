@@ -36,12 +36,12 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 WORKDIR /src
 
 # The compiler version is single-sourced from rust-toolchain.toml: the file is
-# copied in first, and `rustup show active-toolchain` reads it and installs
-# whatever it names. Nothing here repeats the version number, so a bump to the
-# file is the whole change. Its own layer, so editing source does not reinstall
-# the toolchain.
+# copied in first, and `rustup toolchain install` with no toolchain named reads
+# it and installs what it asks for. Nothing here repeats the version number, so
+# a bump to the file is the whole change. Its own layer, so editing source does
+# not reinstall the toolchain.
 COPY rust-toolchain.toml ./
-RUN rustup show active-toolchain
+RUN rustup toolchain install
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
