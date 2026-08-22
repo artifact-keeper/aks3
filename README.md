@@ -187,6 +187,17 @@ volumes:
 Point the AWS CLI at it exactly as in [Talking to it](#talking-to-it), with
 `--endpoint-url http://127.0.0.1:9000`.
 
+### Stopping it
+
+`docker stop` asks with SIGTERM, as do a Kubernetes pod deletion and a systemd
+unit stop. aks3 treats it the same way it treats `Ctrl-C`: it stops accepting
+new connections and gives the ones already running up to ten seconds to finish
+before exiting 0, so a `GetObject` part way through its body is not cut off. A
+stop with nothing in flight takes a fraction of a second.
+
+Connections still open when those ten seconds are up are dropped, and the
+server says so in its log before it exits.
+
 ### What is in the image
 
 The base is `registry.access.redhat.com/ubi9/ubi-micro`, which carries no
