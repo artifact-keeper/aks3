@@ -26,6 +26,18 @@ ROOT_PASSWORD="smoketestsecret"
 # How long the server gets to bind and answer before this is called a failure.
 READY_TIMEOUT_SECONDS=60
 
+# How long `docker stop` is told to wait before it gives up and sends SIGKILL.
+# Passed explicitly rather than left to the default, so that what this measures
+# is the server rather than whatever the local daemon happens to allow.
+STOP_GRACE_SECONDS=10
+
+# How long a healthy stop is allowed to take. A server with nothing in flight
+# drains and exits in a fraction of a second, so this is loose enough that a
+# busy runner cannot trip it and still far below both the server's own eight
+# second drain window and STOP_GRACE_SECONDS, which is what lets a failure say
+# which of the two went wrong.
+STOP_MAX_SECONDS=3
+
 # How long the credential-less container gets to prove it has given up. It
 # should exit immediately; anything still alive at the end of this is a server
 # that started without credentials, which is the failure this checks for.
@@ -150,6 +162,54 @@ aws --endpoint-url "$ENDPOINT" s3 rm "s3://$BUCKET/object.bin"
 aws --endpoint-url "$ENDPOINT" s3 rb "s3://$BUCKET"
 
 # ---------------------------------------------------------------------------
+# The stop. `docker stop`, a Kubernetes pod deletion and `systemctl stop` all
+# ask with SIGTERM and only reach for SIGKILL once their grace period is up, so
+# a server that does not handle SIGTERM burns the whole grace period on every
+# stop, dies with 137, and cuts off whatever it was serving. As PID 1 it does
+# not even get the kernel's default disposition to fall back on.
+#
+# Timed in whole seconds, which is all $SECONDS offers and all this needs: a
+# healthy stop is a fraction of a second and the failures are seconds apart
+# from it.
+# ---------------------------------------------------------------------------
+step "stopping with SIGTERM"
+stop_started="$SECONDS"
+docker stop -t "$STOP_GRACE_SECONDS" "$CONTAINER" >/dev/null
+stop_elapsed=$((SECONDS - stop_started))
+stop_status="$(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER")"
+# Captured rather than piped into `grep -q`, which exits at its first match:
+# under `pipefail` the SIGPIPE that gives `docker logs` would fail the pipeline
+# on exactly the runs that ought to pass. Same reason as the refusal check
+# below.
+stop_log="$(docker logs "$CONTAINER" 2>&1)"
+echo "stopped in ${stop_elapsed}s with status $stop_status"
+
+if [ "$stop_elapsed" -ge "$STOP_MAX_SECONDS" ]; then
+    if [ "$stop_elapsed" -ge "$STOP_GRACE_SECONDS" ]; then
+        echo "took the full ${STOP_GRACE_SECONDS}s grace period, so SIGTERM was ignored" >&2
+    else
+        echo "took ${stop_elapsed}s: SIGTERM was caught, but the drain did not finish" >&2
+    fi
+    exit 1
+fi
+if [ "$stop_status" -ne 0 ]; then
+    echo "exited with $stop_status rather than 0 (137 means it was killed)" >&2
+    exit 1
+fi
+# The exit status alone cannot tell a drain from a lucky race, so these check
+# that the server said what stopped it and that the drain then ran to the end.
+# The second is what separates a completed drain from one that gave up on
+# connections still open when the window closed.
+if ! grep -q "received SIGTERM" <<<"$stop_log"; then
+    echo "stopped without logging that it received SIGTERM" >&2
+    exit 1
+fi
+if ! grep -q "all connections closed" <<<"$stop_log"; then
+    echo "stopped without finishing the drain" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
 # The refusal. Without root credentials the server must exit non-zero rather
 # than come up on something guessable, and it must say which setting is
 # missing.
@@ -157,11 +217,11 @@ aws --endpoint-url "$ENDPOINT" s3 rb "s3://$BUCKET"
 # Bounded, because the failure this is looking for is a server that starts and
 # keeps running: unbounded, that case would hang the job rather than fail it.
 #
-# Started detached and polled, rather than run in the foreground under
-# `timeout`. The foreground form deadlocks on exactly the failure it is meant
-# to catch: `timeout` signals the docker client, the client forwards the signal
-# to a container whose PID 1 has no SIGTERM handler and therefore ignores it,
-# and the client waits for an exit that never comes.
+# Started detached and polled rather than run in the foreground under
+# `timeout`, so that what is asserted on is the container's own exit status and
+# its own logs, read back after it has stopped. Under `timeout` the status that
+# reaches the script is the one the signalled client reports, which says
+# nothing about whether the server refused or was stopped.
 # ---------------------------------------------------------------------------
 step "refusing to start without credentials"
 docker run -d --name "$REFUSAL_CONTAINER" "$IMAGE" >/dev/null

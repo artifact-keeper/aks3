@@ -187,6 +187,38 @@ volumes:
 Point the AWS CLI at it exactly as in [Talking to it](#talking-to-it), with
 `--endpoint-url http://127.0.0.1:9000`.
 
+### Stopping it
+
+`docker stop` asks with SIGTERM, as do a Kubernetes pod deletion and a systemd
+unit stop. aks3 treats it the same way it treats `Ctrl-C`: it stops accepting
+new connections and gives the ones already running up to eight seconds to
+finish before exiting 0, so a `GetObject` part way through its body is not cut
+off. A stop with nothing in flight takes a fraction of a second.
+
+Connections still open when those eight seconds are up are dropped, and the
+server says so in its log before it exits. Eight seconds is not configurable,
+and raising a supervisor's stop timeout does not lengthen it.
+
+What the timeout does is protect it. Whatever sent the SIGTERM is counting down
+to a SIGKILL of its own, and if that lands first the drain is cut off part way
+through and the container reports exit code 137. `docker stop` allows ten
+seconds by default, which is enough, but it is worth setting rather than
+inheriting:
+
+```
+docker stop -t 30 aks3
+```
+
+```yaml
+services:
+  aks3:
+    stop_grace_period: 30s
+```
+
+Kubernetes allows thirty seconds by default (`terminationGracePeriodSeconds`),
+and systemd ninety (`TimeoutStopSec`), so neither needs changing. Anything set
+below eight seconds does need changing, or every stop ends in a SIGKILL.
+
 ### What is in the image
 
 The base is `registry.access.redhat.com/ubi9/ubi-micro`, which carries no

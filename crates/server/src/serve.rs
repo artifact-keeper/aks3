@@ -20,6 +20,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use hyper_util::server::graceful::{GracefulShutdown, Watcher};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::sync::oneshot;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::ServerConfig;
@@ -35,7 +36,16 @@ use crate::config::{Config, TlsConfig};
 /// How long a shutdown waits for connections that are still in flight before
 /// dropping them. A `GET` of a large object is a long-lived connection, so this
 /// is generous enough to let one finish rather than tuned for a fast exit.
-const GRACE_PERIOD: Duration = Duration::from_secs(10);
+///
+/// It has to stay under the timeout of whatever sent the signal, because that
+/// timeout ends in SIGKILL. `docker stop` waits ten seconds by default, so a
+/// ten second window here would be a tie, and a tie is lost: the drain is still
+/// deciding when the process is killed under it, which is the outcome the drain
+/// exists to avoid. Eight seconds leaves the margin that makes the common case
+/// resolve on the server's terms. Anything still open when it expires is
+/// dropped, so raising a supervisor's timeout protects this window rather than
+/// lengthening it.
+const GRACE_PERIOD: Duration = Duration::from_secs(8);
 
 /// How long the accept loop waits after a failed `accept` before trying again.
 ///
@@ -64,17 +74,24 @@ enum Transport {
     Tls(TlsAcceptor),
 }
 
-/// Runs the server until `Ctrl-C`.
+/// Runs the server until SIGINT or SIGTERM arrives, then drains.
 ///
 /// The bound address is sent on `bound` before the first connection is
 /// accepted, which is how a caller that asked for port 0 learns which port it
 /// got. A caller that does not care can drop the receiver.
 ///
-/// Errors if the store cannot be opened, the root credentials are rejected, the
-/// TLS material is unusable, or the listen address cannot be bound. An error
-/// after that point belongs to one connection and is logged, not returned:
-/// a client that hangs up mid-request does not stop the server.
+/// Errors if the signal handlers cannot be installed, the store cannot be
+/// opened, the root credentials are rejected, the TLS material is unusable, or
+/// the listen address cannot be bound. An error after that point belongs to one
+/// connection and is logged, not returned: a client that hangs up mid-request
+/// does not stop the server.
 pub async fn run(cfg: Config, bound: oneshot::Sender<SocketAddr>) -> anyhow::Result<()> {
+    // Before anything slow, so that a stop request arriving during startup is
+    // held rather than lost. Opening a large store sweeps its temp directory,
+    // and a container told to stop in that window has no handler to catch the
+    // SIGTERM yet if this waits until the accept loop.
+    let signals = ShutdownSignals::install()?;
+
     let engine = FsEngine::open(&cfg.data_dir)
         .await
         .with_context(|| format!("opening the store at {}", cfg.data_dir.display()))?;
@@ -110,15 +127,19 @@ pub async fn run(cfg: Config, bound: oneshot::Sender<SocketAddr>) -> anyhow::Res
     // The receiver is optional; a caller that already knows the address drops it.
     let _ = bound.send(addr);
 
-    accept_loop(listener, transport, service).await;
+    accept_loop(listener, transport, service, signals).await;
     Ok(())
 }
 
-/// Accepts connections until `Ctrl-C`, then waits out [`GRACE_PERIOD`] for the
-/// ones still running.
-async fn accept_loop(listener: TcpListener, transport: Transport, service: S3Service) {
+/// Accepts connections until a shutdown signal arrives, then waits out
+/// [`GRACE_PERIOD`] for the ones still running.
+async fn accept_loop(
+    listener: TcpListener,
+    transport: Transport,
+    service: S3Service,
+    mut signals: ShutdownSignals,
+) {
     let graceful = GracefulShutdown::new();
-    let mut interrupt = std::pin::pin!(tokio::signal::ctrl_c());
 
     loop {
         let stream = tokio::select! {
@@ -132,7 +153,7 @@ async fn accept_loop(listener: TcpListener, transport: Transport, service: S3Ser
                 // listener's death. Log, pause, and take the next one. The
                 // pause is unconditional because the error alone does not say
                 // whether the cause has gone away; see ACCEPT_ERROR_BACKOFF.
-                // It delays a `Ctrl-C` by at most one backoff, since the next
+                // It delays a shutdown by at most one backoff, since the next
                 // pass through the loop selects on the signal again.
                 Err(err) => {
                     tracing::warn!("accept failed: {err}");
@@ -140,8 +161,8 @@ async fn accept_loop(listener: TcpListener, transport: Transport, service: S3Ser
                     continue;
                 }
             },
-            _ = interrupt.as_mut() => {
-                tracing::info!("interrupted, draining connections");
+            name = signals.recv() => {
+                tracing::info!("received {name}, draining connections");
                 break;
             }
         };
@@ -158,6 +179,52 @@ async fn accept_loop(listener: TcpListener, transport: Transport, service: S3Ser
         () = graceful.shutdown() => tracing::info!("all connections closed"),
         () = tokio::time::sleep(GRACE_PERIOD) => {
             tracing::warn!("connections still open after {GRACE_PERIOD:?}, exiting anyway");
+        }
+    }
+}
+
+/// The two signals that ask this server to stop.
+///
+/// SIGINT is `Ctrl-C` at a terminal. SIGTERM is what everything else uses:
+/// `docker stop`, a Kubernetes pod deletion and `systemctl stop` all send it
+/// first and only reach for SIGKILL once their grace period runs out. It has to
+/// be handled explicitly, because a process running as PID 1 in a container
+/// gets no default dispositions from the kernel, so a SIGTERM with no handler
+/// installed is discarded rather than fatal. Left unhandled there, every stop
+/// request is ignored, every stop takes the full grace period, and the drain in
+/// [`accept_loop`] never runs: an in-flight `GetObject` is cut off by the
+/// SIGKILL instead of being allowed to finish.
+///
+/// `tokio::signal::unix` limits this to Unix, which the rest of the server
+/// already requires (see `aks3_engine::atomic`).
+struct ShutdownSignals {
+    interrupt: Signal,
+    terminate: Signal,
+}
+
+impl ShutdownSignals {
+    /// Installs both handlers.
+    ///
+    /// Errors if either cannot be registered. That is fatal rather than a
+    /// warning: a server nobody can ask to stop is one an operator can only
+    /// kill, and finding that out at startup beats finding it out during a
+    /// deploy.
+    fn install() -> anyhow::Result<Self> {
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt()).context("listening for SIGINT")?,
+            terminate: signal(SignalKind::terminate()).context("listening for SIGTERM")?,
+        })
+    }
+
+    /// Resolves at whichever arrives first, naming it for the log.
+    ///
+    /// Cancel-safe, which is what lets the accept loop select on it: a signal
+    /// that has not arrived yet is not consumed by a poll that loses the race
+    /// to an incoming connection.
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.interrupt.recv() => "SIGINT",
+            _ = self.terminate.recv() => "SIGTERM",
         }
     }
 }
