@@ -79,7 +79,7 @@ jobs:
       # Loaded into the local daemon, not pushed. The smoke test below is what
       # decides whether this image is allowed to leave the runner.
       - name: Build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -204,7 +204,7 @@ jobs:
       - name: Push by digest
         id: push
         if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
