@@ -36,7 +36,16 @@ use crate::config::{Config, TlsConfig};
 /// How long a shutdown waits for connections that are still in flight before
 /// dropping them. A `GET` of a large object is a long-lived connection, so this
 /// is generous enough to let one finish rather than tuned for a fast exit.
-const GRACE_PERIOD: Duration = Duration::from_secs(10);
+///
+/// It has to stay under the timeout of whatever sent the signal, because that
+/// timeout ends in SIGKILL. `docker stop` waits ten seconds by default, so a
+/// ten second window here would be a tie, and a tie is lost: the drain is still
+/// deciding when the process is killed under it, which is the outcome the drain
+/// exists to avoid. Eight seconds leaves the margin that makes the common case
+/// resolve on the server's terms. Anything still open when it expires is
+/// dropped, so raising a supervisor's timeout protects this window rather than
+/// lengthening it.
+const GRACE_PERIOD: Duration = Duration::from_secs(8);
 
 /// How long the accept loop waits after a failed `accept` before trying again.
 ///

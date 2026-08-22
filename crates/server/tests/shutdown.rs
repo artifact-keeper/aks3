@@ -23,7 +23,7 @@ const LOG_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the child gets to exit once it has been signalled.
 ///
 /// Far above the near-instant exit expected of a server holding no connections,
-/// and above the ten second grace period it would wait out even if it thought
+/// and above the eight second grace period it would wait out even if it thought
 /// it held one, so reaching this means the signal was ignored rather than that
 /// the machine was busy.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(30);
