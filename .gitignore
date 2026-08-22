@@ -2,3 +2,6 @@
 *.pem
 .DS_Store
 /tests/compliance/s3-tests/
+
+# Internal planning and process docs stay local
+/docs/superpowers/
