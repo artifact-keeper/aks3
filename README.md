@@ -235,3 +235,12 @@ Anything beyond that wants tools the image does not have, so use
 docker run --rm -it --pid container:aks3 --network container:aks3 \
   registry.access.redhat.com/ubi9/ubi bash
 ```
+
+Every image is scanned with Trivy before it is pushed, and a CRITICAL or HIGH
+finding that upstream has already fixed stops the publish. Findings with no fix
+released do not, because a package ubi-micro has not yet had a fix for is Red
+Hat's to release and blocking on it would only stop us shipping anything else.
+Those are still recorded: the full results, all severities, go to this
+repository's code scanning alerts, and a weekly job rescans the published
+`latest` so a vulnerability disclosed after the build turns into a tracking
+issue rather than going unnoticed.

@@ -1,0 +1,194 @@
+name: image scan
+
+# Rescans the image that is already published, once a week.
+#
+# The gate in container.yml checks an image at the moment it is built, which
+# says nothing about a vulnerability disclosed the week after. The published
+# `latest` accumulates those quietly, and the only way to notice is to look
+# again.
+#
+# This one reports rather than blocks, because there is nothing left to block:
+# the image is out and people are pulling it. What it does instead is keep a
+# single tracking issue matched to what the scan currently finds, opening it on
+# the first finding, rewriting it when the finding set changes, and closing it
+# when the findings are gone. A scheduled job whose only output is a red tick
+# in the Actions tab is a job nobody reads.
+#
+# workflow_dispatch is here so the whole thing can be run on demand rather than
+# waited on, which is also the only way to exercise it before a Monday.
+on:
+  schedule:
+    # Monday morning UTC, deliberately off the hour: everything scheduled at
+    # :00 queues behind everything else scheduled at :00.
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}:latest
+  # The dedupe key. Matched exactly, so this text is what stops a weekly job
+  # from filing a new issue every Monday, and changing it orphans the open one.
+  ISSUE_TITLE: Vulnerabilities in the published image
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+      issues: write
+    steps:
+      # For .trivyignore.yaml, which is the same list of accepted findings the
+      # build-time gate uses. A finding excused there should not come back as
+      # an issue here.
+      - uses: actions/checkout@v4
+
+      # The package is public and would pull anonymously, but anonymous pulls
+      # are the ones that get rate limited. Trivy reads the docker config this
+      # writes.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Every severity, and nothing set to fail: the exit code is not the
+      # report here, the issue below is.
+      - name: Scan the published image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          scanners: vuln
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          trivyignores: .trivyignore.yaml
+          format: json
+          output: ${{ runner.temp }}/trivy-report.json
+          exit-code: "0"
+
+      - name: Convert the report for code scanning
+        env:
+          REPORT: ${{ runner.temp }}/trivy-report.json
+          SARIF: ${{ runner.temp }}/trivy-results.sarif
+        run: trivy convert --format sarif --output "$SARIF" "$REPORT"
+
+      # Its own category, so a rescan of the published image never overwrites
+      # the per-architecture results the build workflow uploads.
+      - name: Publish the report to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ runner.temp }}/trivy-results.sarif
+          category: trivy-published
+
+      # Actionable means CRITICAL or HIGH with a fix released, matching what
+      # the build gate blocks on. Everything else goes in the report as a count
+      # and lives in the code scanning alerts, which is where a full list
+      # belongs.
+      #
+      # The fingerprint is what keeps this quiet: the same findings next Monday
+      # produce the same digest, and the step below then leaves the issue
+      # alone rather than commenting on it again.
+      - name: Describe what is actionable
+        id: report
+        env:
+          REPORT: ${{ runner.temp }}/trivy-report.json
+          BODY: ${{ runner.temp }}/issue-body.md
+          IMAGE_REF: ${{ env.IMAGE }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          jq -r '
+            [.Results[]?.Vulnerabilities[]?]
+            | map(select(.Severity == "CRITICAL" or .Severity == "HIGH"))
+            | map(select((.FixedVersion // "") != ""))
+            | sort_by(.VulnerabilityID, .PkgName)
+            | .[]
+            | "| \(.Severity) | [\(.VulnerabilityID)](\(.PrimaryURL // "")) | \(.PkgName) | \(.InstalledVersion) | \(.FixedVersion) |"
+          ' "$REPORT" > "${RUNNER_TEMP}/rows.md"
+
+          actionable=$(wc -l < "${RUNNER_TEMP}/rows.md" | tr -d ' ')
+          unfixed=$(jq -r '
+            [.Results[]?.Vulnerabilities[]?]
+            | map(select(.Severity == "CRITICAL" or .Severity == "HIGH"))
+            | map(select((.FixedVersion // "") == ""))
+            | length
+          ' "$REPORT")
+          total=$(jq -r '[.Results[]?.Vulnerabilities[]?] | length' "$REPORT")
+
+          fingerprint=$(sha256sum "${RUNNER_TEMP}/rows.md" | cut -c1-16)
+
+          {
+            echo "The weekly scan of \`${IMAGE_REF}\` found ${actionable} finding(s) at CRITICAL or HIGH with a fix released upstream."
+            echo
+            if [ "$actionable" -gt 0 ]; then
+              echo "| Severity | Advisory | Package | Installed | Fixed in |"
+              echo "| --- | --- | --- | --- | --- |"
+              cat "${RUNNER_TEMP}/rows.md"
+              echo
+            fi
+            echo "Also present, and not blocked on by policy: ${unfixed} at CRITICAL or HIGH with no fix released, ${total} across all severities. The full list is in the code scanning alerts under the \`trivy-published\` category."
+            echo
+            echo "For an OS package, the fix is whichever ubi-micro digest Dependabot offers next, or a manual bump of the pin in the Dockerfile. For a Rust dependency it is a Cargo.lock bump. Either way, publishing the rebuild is what closes this."
+            echo
+            echo "This body is rewritten by the image scan workflow whenever the findings change, so notes are better left as comments. Last run: ${RUN_URL}"
+            echo
+            echo "<!-- findings-fingerprint: ${fingerprint} -->"
+          } > "$BODY"
+
+          {
+            echo "actionable=${actionable}"
+            echo "fingerprint=${fingerprint}"
+          } >> "$GITHUB_OUTPUT"
+
+          cat "$BODY" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open, update or close the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TITLE: ${{ env.ISSUE_TITLE }}
+          BODY: ${{ runner.temp }}/issue-body.md
+          ACTIONABLE: ${{ steps.report.outputs.actionable }}
+          FINGERPRINT: ${{ steps.report.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+
+          # Exact title match rather than whatever the search ranked first, so
+          # an unrelated issue that happens to mention the same words is never
+          # mistaken for this one.
+          number=$(gh issue list --repo "$REPO" --state open --limit 100 \
+            --search "in:title $TITLE" --json number,title \
+            | jq -r --arg t "$TITLE" 'map(select(.title == $t)) | .[0].number // empty')
+
+          if [ "$ACTIONABLE" -eq 0 ]; then
+            if [ -n "$number" ]; then
+              gh issue comment "$number" --repo "$REPO" \
+                --body "The scan no longer finds anything at CRITICAL or HIGH with a fix released. Closing; it will reopen as a new issue if that changes."
+              gh issue close "$number" --repo "$REPO"
+              echo "Closed #${number}: nothing actionable left."
+            else
+              echo "Nothing actionable, and no open issue to close."
+            fi
+            exit 0
+          fi
+
+          if [ -z "$number" ]; then
+            url=$(gh issue create --repo "$REPO" --title "$TITLE" --body-file "$BODY")
+            echo "Opened ${url}"
+            exit 0
+          fi
+
+          if gh issue view "$number" --repo "$REPO" --json body --jq .body \
+            | grep -qF "findings-fingerprint: ${FINGERPRINT}"; then
+            echo "#${number} already describes these findings; left alone."
+            exit 0
+          fi
+
+          gh issue edit "$number" --repo "$REPO" --body-file "$BODY"
+          gh issue comment "$number" --repo "$REPO" \
+            --body "The set of findings changed. The description above has been rewritten to match this week's scan."
+          echo "Updated #${number}."
