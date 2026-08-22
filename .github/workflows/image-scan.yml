@@ -45,7 +45,7 @@ jobs:
       # For .trivyignore.yaml, which is the same list of accepted findings the
       # build-time gate uses. A finding excused there should not come back as
       # an issue here.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The package is public and would pull anonymously, but anonymous pulls
       # are the ones that get rate limited. Trivy reads the docker config this
