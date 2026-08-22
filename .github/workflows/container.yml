@@ -257,21 +257,47 @@ jobs:
       # publishes 0.2.0, without the v, because that is what a Docker tag
       # conventionally looks like. Every build also gets an immutable
       # sha-<short> tag to pin to.
-      - name: Tags
+      #
+      # The annotations input is deliberately separate from the labels input
+      # the build job uses: metadata-action builds the two from different
+      # sources, so pinning one does nothing for the other. Without these
+      # three pinned the index would carry the repository's own blurb and
+      # license as its description and licenses, which is what made the index
+      # disagree with the per-platform images it points at.
+      #
+      # index is the only level worth emitting here. imagetools create can
+      # annotate the index and the descriptors inside it, but not the platform
+      # manifests, which already carry the build job's labels anyway.
+      - name: Tags and annotations
         id: meta
         uses: docker/metadata-action@v5
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
         with:
           images: ${{ env.IMAGE }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
             type=sha
+          annotations: |
+            org.opencontainers.image.title=aks3
+            org.opencontainers.image.description=Single-binary S3-compatible object store
+            org.opencontainers.image.licenses=AGPL-3.0-only
 
       - name: Create and push the manifest list
         working-directory: /tmp/digests
         run: |
+          # Read into an array rather than word-split like the tags below: an
+          # annotation value is a sentence and would otherwise arrive as one
+          # argument per word.
+          annotations=()
+          while IFS= read -r annotation; do
+            annotations+=(--annotation "$annotation")
+          done < <(jq -r '.annotations[]' <<<"$DOCKER_METADATA_OUTPUT_JSON")
+
           # shellcheck disable=SC2046  # both substitutions are deliberately word-split into arguments
           docker buildx imagetools create \
+            "${annotations[@]}" \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<<"$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf "${IMAGE}@sha256:%s " *)
 
