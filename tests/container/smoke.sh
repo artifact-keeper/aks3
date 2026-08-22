@@ -26,24 +26,44 @@ ROOT_PASSWORD="smoketestsecret"
 # How long the server gets to bind and answer before this is called a failure.
 READY_TIMEOUT_SECONDS=60
 
+# How long the credential-less container gets to prove it has given up. It
+# should exit immediately; anything still alive at the end of this is a server
+# that started without credentials, which is the failure this checks for.
+REFUSAL_TIMEOUT_SECONDS=30
+
 CONTAINER=""
+# Named rather than left to `--rm`, so the exit status and the logs can be read
+# back after it stops, and so cleanup can find it if it never does.
+REFUSAL_CONTAINER="aks3-smoke-nocreds-$$"
 WORKDIR="$(mktemp -d)"
 
+# Prints everything a container said. Called from the exit trap, so a failure
+# anywhere (including in the middle of the AWS CLI steps) comes with the log
+# rather than just a non-zero status.
+dump_logs() {
+    local name="$1"
+    [ -n "$name" ] || return 0
+    docker inspect "$name" >/dev/null 2>&1 || return 0
+    echo "--- logs: $name ---" >&2
+    docker logs "$name" >&2 2>&1 || true
+    echo "--- end logs: $name ---" >&2
+}
+
 cleanup() {
-    if [ -n "$CONTAINER" ]; then
-        docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    local status=$?
+    if [ "$status" -ne 0 ]; then
+        dump_logs "$CONTAINER"
+        dump_logs "$REFUSAL_CONTAINER"
     fi
+    # -v as well as -f: without it every run leaves behind the anonymous volume
+    # the image's `VOLUME /data` creates.
+    for name in "$CONTAINER" "$REFUSAL_CONTAINER"; do
+        [ -n "$name" ] && docker rm -fv "$name" >/dev/null 2>&1 || true
+    done
     rm -rf "$WORKDIR"
+    return "$status"
 }
 trap cleanup EXIT
-
-# Prints everything the container said, for a failure that would otherwise be
-# reported as a bare timeout.
-dump_logs() {
-    echo "--- container logs ---" >&2
-    docker logs "$CONTAINER" >&2 2>&1 || true
-    echo "--- end container logs ---" >&2
-}
 
 step() {
     echo
@@ -72,7 +92,6 @@ status=""
 while [ "$SECONDS" -lt "$deadline" ]; do
     if ! docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true; then
         echo "container exited before it answered" >&2
-        dump_logs
         exit 1
     fi
     status="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$ENDPOINT/" || true)"
@@ -84,7 +103,6 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 if [ -z "$status" ] || [ "$status" = "000" ]; then
     echo "no HTTP response within ${READY_TIMEOUT_SECONDS}s" >&2
-    dump_logs
     exit 1
 fi
 if [ "$status" != "403" ]; then
@@ -124,7 +142,6 @@ aws --endpoint-url "$ENDPOINT" s3 cp "s3://$BUCKET/object.bin" "$RECEIVED"
 
 if ! cmp -s "$SENT" "$RECEIVED"; then
     echo "object came back different from what was sent" >&2
-    dump_logs
     exit 1
 fi
 echo "1 MiB roundtripped byte for byte"
@@ -132,21 +149,46 @@ echo "1 MiB roundtripped byte for byte"
 aws --endpoint-url "$ENDPOINT" s3 rm "s3://$BUCKET/object.bin"
 aws --endpoint-url "$ENDPOINT" s3 rb "s3://$BUCKET"
 
-step "stopping the container"
-docker rm -f "$CONTAINER" >/dev/null
-CONTAINER=""
-
 # ---------------------------------------------------------------------------
 # The refusal. Without root credentials the server must exit non-zero rather
 # than come up on something guessable, and it must say which setting is
 # missing.
+#
+# Bounded, because the failure this is looking for is a server that starts and
+# keeps running: unbounded, that case would hang the job rather than fail it.
+#
+# Started detached and polled, rather than run in the foreground under
+# `timeout`. The foreground form deadlocks on exactly the failure it is meant
+# to catch: `timeout` signals the docker client, the client forwards the signal
+# to a container whose PID 1 has no SIGTERM handler and therefore ignores it,
+# and the client waits for an exit that never comes.
 # ---------------------------------------------------------------------------
 step "refusing to start without credentials"
-if output="$(docker run --rm "$IMAGE" 2>&1)"; then
-    echo "started with no credentials; it must not" >&2
+docker run -d --name "$REFUSAL_CONTAINER" "$IMAGE" >/dev/null
+
+deadline=$((SECONDS + REFUSAL_TIMEOUT_SECONDS))
+running="true"
+while [ "$SECONDS" -lt "$deadline" ]; do
+    running="$(docker inspect -f '{{.State.Running}}' "$REFUSAL_CONTAINER")"
+    [ "$running" = "false" ] && break
+    sleep 1
+done
+
+if [ "$running" != "false" ]; then
+    echo "still running after ${REFUSAL_TIMEOUT_SECONDS}s, so it started with no credentials" >&2
+    exit 1
+fi
+
+refusal_status="$(docker inspect -f '{{.State.ExitCode}}' "$REFUSAL_CONTAINER")"
+output="$(docker logs "$REFUSAL_CONTAINER" 2>&1)"
+
+if [ "$refusal_status" -eq 0 ]; then
+    echo "exited cleanly with no credentials; it must not" >&2
     echo "$output" >&2
     exit 1
 fi
+
+echo "exited with status $refusal_status"
 echo "$output"
 if ! grep -q "AKS3_ROOT_USER" <<<"$output"; then
     echo "exited non-zero but did not name AKS3_ROOT_USER" >&2
