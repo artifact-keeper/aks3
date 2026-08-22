@@ -11,7 +11,7 @@ edition = "2021"
 # compiler would otherwise produce partway through a dependency.
 rust-version = "1.94.1"
 license = "AGPL-3.0-only"
-repository = "https://example.invalid/aks3"
+repository = "https://github.com/artifact-keeper/aks3"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
