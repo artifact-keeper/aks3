@@ -1,0 +1,14 @@
+# What the image build never reads, kept out of the context so a build does not
+# begin by shipping a multi-gigabyte target directory to the daemon.
+#
+# Cargo.lock and rust-toolchain.toml are deliberately absent from this list.
+# The build passes --locked, which needs the first, and takes its compiler
+# version from the second; excluding either would break the build rather than
+# slim it.
+
+target/
+.git/
+docs/
+tests/compliance/s3-tests/
+.superpowers/
+*.bundle

@@ -143,3 +143,63 @@ The same operations driven from the AWS SDK for Rust are what
   allows any key up to 1024 bytes, so such a key is legal and aks3 rejects it,
   with `KeyTooLongError` and a 400 from every operation on it. Nesting the key
   with `/` separators keeps each component under the limit.
+
+## Run with Docker
+
+Images are published to `ghcr.io/artifact-keeper/aks3` for `linux/amd64` and
+`linux/arm64`. `latest` follows the default branch, a release tag `v0.2.0`
+publishes `0.2.0`, and every build also gets an immutable `sha-<short>` tag.
+
+```
+docker run -d --name aks3 \
+  -e AKS3_ROOT_USER=admin \
+  -e AKS3_ROOT_PASSWORD=secretpassword \
+  -p 9000:9000 \
+  -v aks3-data:/data \
+  ghcr.io/artifact-keeper/aks3:latest
+```
+
+The image sets `AKS3_LISTEN=0.0.0.0:9000` and `AKS3_DATA_DIR=/data`, so the
+credentials are the only thing it needs from you. There is no default for them
+and the container exits non-zero without both, naming the one it is missing.
+
+It runs as uid 1001 in group 0, and `/data` is group-writable, so a runtime
+that substitutes a uid of its own works as long as the uid is in group 0.
+
+The same options in compose:
+
+```yaml
+services:
+  aks3:
+    image: ghcr.io/artifact-keeper/aks3:latest
+    ports:
+      - "9000:9000"
+    environment:
+      AKS3_ROOT_USER: admin
+      AKS3_ROOT_PASSWORD: secretpassword
+    volumes:
+      - aks3-data:/data
+
+volumes:
+  aks3-data:
+```
+
+Point the AWS CLI at it exactly as in [Talking to it](#talking-to-it), with
+`--endpoint-url http://127.0.0.1:9000`.
+
+### What is in the image
+
+The base is `registry.access.redhat.com/ubi9/ubi-micro`, which carries no
+package manager: no `dnf`, no `microdnf`, no `rpm`. Nothing can be installed
+into a running container, and there is no `curl`, no `ps`, and no network
+tooling in there to reach for.
+
+There is a shell. `bash` and coreutils come with the base, so
+`docker exec -it aks3 bash` works for looking at what is under `/data`.
+Anything beyond that wants tools the image does not have, so use
+`docker debug aks3`, or a container that shares its namespaces:
+
+```
+docker run --rm -it --pid container:aks3 --network container:aks3 \
+  registry.access.redhat.com/ubi9/ubi bash
+```

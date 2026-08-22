@@ -1,0 +1,177 @@
+name: container
+
+# Builds ghcr.io/artifact-keeper/aks3, and publishes it from main and release
+# tags.
+#
+# Pull requests run the build and the smoke gate but touch the registry not at
+# all: the steps that need a writable token are skipped, because a pull request
+# from a fork is given a read-only one and the login alone would fail. What is
+# left still answers the question a pull request asks, which is whether this
+# change produces an image that works.
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  # One job per architecture, each on a runner of that architecture. Native
+  # compilation rather than QEMU, because emulating a Rust build of this size
+  # takes long enough to stop being worth the simpler workflow.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Resolved once, and fed to both builds below, so the image that gets
+      # smoke tested is the same image that gets pushed rather than one that
+      # differs by a timestamp label.
+      #
+      # title, description and licenses are pinned here rather than left to be
+      # inferred from the GitHub repository, which would make the labels change
+      # when someone edits the repository blurb. revision, created and version
+      # come from the event and are the point of running this at all: without
+      # them the image keeps ubi-micro's own revision label, which combined with
+      # our source label reads as aks3 at a Red Hat commit.
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          labels: |
+            org.opencontainers.image.title=aks3
+            org.opencontainers.image.description=Single-binary S3-compatible object store
+            org.opencontainers.image.licenses=AGPL-3.0-only
+
+      # Loaded into the local daemon, not pushed. The smoke test below is what
+      # decides whether this image is allowed to leave the runner.
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: aks3:candidate
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      # Preinstalled on GitHub's Ubuntu images. The fallback is here because
+      # the toolset differs between the x86 and Arm images, and a smoke test
+      # that silently skipped its only real assertion would be worse than a
+      # slower one.
+      - name: Ensure the AWS CLI is present
+        run: |
+          if ! command -v aws >/dev/null 2>&1; then
+            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp/awscliv2
+            sudo /tmp/awscliv2/aws/install
+          fi
+          aws --version
+
+      - name: Smoke test
+        run: tests/container/smoke.sh aks3:candidate
+
+      # The same build again, which the layer cache makes close to free, this
+      # time as a push of an untagged manifest. Tags are applied once, by the
+      # merge job, so no tag ever points at a half-published set of platforms.
+      - name: Push by digest
+        id: push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Record the digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.push.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Ties the per-architecture digests together under the tags a user actually
+  # pulls. Runs only if both builds and both smoke tests passed, and never on a
+  # pull request, which has nothing pushed to tie together.
+  merge:
+    needs: [build]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `latest` only from the default branch; a version tag such as v0.2.0
+      # publishes 0.2.0, without the v, because that is what a Docker tag
+      # conventionally looks like. Every build also gets an immutable
+      # sha-<short> tag to pin to.
+      - name: Tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=sha
+
+      - name: Create and push the manifest list
+        working-directory: /tmp/digests
+        run: |
+          # shellcheck disable=SC2046  # both substitutions are deliberately word-split into arguments
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<<"$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Inspect what was published
+        run: docker buildx imagetools inspect "${IMAGE}:${{ steps.meta.outputs.version }}"
