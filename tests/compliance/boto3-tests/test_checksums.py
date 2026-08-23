@@ -23,10 +23,14 @@ header to the handler through S3Request.trailing_headers once the body is
 consumed; it verifies the trailer signature but not the checksum value, so the
 value comparison is aks3's to make, and it makes it.
 
-CRC32, SHA1 and SHA256 are covered: those are the algorithms a plain boto3 can
-compute. CRC32C and CRC64NVME need boto3's awscrt extra, which the lockfile
-omits (test_crt_algorithms_are_out_of_reach), so nothing here can reach them;
-they stay on the pre-existing pass-through and are documented as follow-on work.
+All five S3 algorithms are verified server-side: CRC32, CRC32C, SHA1, SHA256 and
+CRC64NVME. This file only exercises CRC32/SHA1/SHA256 end to end, because
+CRC32C and CRC64NVME need boto3's awscrt extra, which the lockfile omits
+(test_crt_algorithms_are_out_of_reach pins that client limit). The two CRT
+algorithms are covered by the Rust suite instead (server-side verify does not
+depend on the client being able to send them). The invariant either way: a
+checksum requested for any algorithm is verified or the request is refused,
+never stored unverified.
 
 One divergence found alongside these has no SDK that produces it, and unlike
 the rest it has been fixed rather than pinned: a PUT that declares
@@ -417,6 +421,65 @@ def test_a_wrong_trailer_checksum_is_rejected(s3, bucket, endpoint, credentials)
 
     # The framing was decoded (this really did take the trailer path), the
     # trailer did not match, and nothing was committed: the key is absent.
+    with pytest.raises(ClientError) as excinfo:
+        s3.get_object(Bucket=bucket, Key=key)
+    assert excinfo.value.response["Error"]["Code"] == "NoSuchKey"
+
+
+def test_a_declared_trailer_with_no_value_is_rejected(s3, bucket, endpoint, credentials):
+    """A checksum announced via x-amz-trailer but never sent is refused, not
+    stored unverified.
+
+    Once a request commits to a trailing checksum (x-amz-trailer names one and
+    the payload is a streaming-trailer sentinel), the value has to arrive or
+    there is nothing to check the body against. A server that let the empty
+    trailer through would be storing on faith exactly what the checksum exists
+    to prevent. aks3 answers 400 and stores nothing.
+
+    Hand-built: the framing carries the final 0-chunk and an empty trailer block,
+    with no x-amz-checksum-crc32 line, so detect() commits to the trailer form
+    but the value resolves to absent.
+    """
+    import http.client
+    import urllib.parse
+
+    from botocore.exceptions import ClientError
+
+    access_key, secret_key = credentials
+    key = "declared-but-missing-trailer"
+    # Final 0-chunk, then an empty trailer block: the CRLF that would separate
+    # trailers from the end, with no trailer line between.
+    framed = b"%x\r\n" % len(PAYLOAD) + PAYLOAD + b"\r\n0\r\n\r\n"
+
+    class StreamingTrailer(botocore.auth.S3SigV4Auth):
+        def payload(self, request):
+            return "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
+
+    request = botocore.awsrequest.AWSRequest(
+        method="PUT",
+        url=f"{endpoint}/{bucket}/{key}",
+        data=framed,
+        headers={
+            "Content-Encoding": "aws-chunked",
+            "X-Amz-Trailer": "x-amz-checksum-crc32",
+            "X-Amz-Decoded-Content-Length": str(len(PAYLOAD)),
+            "Content-Length": str(len(framed)),
+        },
+    )
+    StreamingTrailer(
+        Credentials(access_key, secret_key), "s3", "us-east-1"
+    ).add_auth(request)
+    prepared = request.prepare()
+
+    parsed = urllib.parse.urlparse(prepared.url)
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=30)
+    connection.request("PUT", parsed.path, body=framed, headers=dict(prepared.headers))
+    response = connection.getresponse()
+    body = response.read()
+    connection.close()
+
+    assert response.status == 400, body
+
     with pytest.raises(ClientError) as excinfo:
         s3.get_object(Bucket=bucket, Key=key)
     assert excinfo.value.response["Error"]["Code"] == "NoSuchKey"

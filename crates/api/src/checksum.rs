@@ -97,32 +97,33 @@ impl Expected {
 /// Work out which checksum, if any, a `PutObject` wants verified.
 ///
 /// Header form wins if present. Otherwise the trailer form is recognised from
-/// `x-amz-trailer` naming an `x-amz-checksum-<algorithm>` trailer for an
-/// algorithm this build computes. A checksum for an algorithm aks3 does not
-/// compute (CRC32C, CRC64NVME) returns `None`, which leaves it on the
-/// pre-existing pass-through: accepted, neither verified nor stored.
+/// `x-amz-trailer` naming an `x-amz-checksum-<algorithm>` trailer. All five S3
+/// algorithms are recognised and verified; `None` means no checksum was sent at
+/// all, which is the only pass-through left. An unknown (non-S3) algorithm name
+/// also returns `None`, since s3s never parses one onto the input and no real
+/// client sends one.
 pub(crate) fn detect(
     input: &PutObjectInput,
     headers: &HeaderMap,
     trailing: Option<&TrailingHeaders>,
 ) -> Option<PutChecksum> {
-    if let Some(value) = input.checksum_crc32.clone() {
-        return Some(PutChecksum {
-            algorithm: ChecksumAlgorithm::Crc32,
-            expected: Expected::Immediate(value),
-        });
-    }
-    if let Some(value) = input.checksum_sha1.clone() {
-        return Some(PutChecksum {
-            algorithm: ChecksumAlgorithm::Sha1,
-            expected: Expected::Immediate(value),
-        });
-    }
-    if let Some(value) = input.checksum_sha256.clone() {
-        return Some(PutChecksum {
-            algorithm: ChecksumAlgorithm::Sha256,
-            expected: Expected::Immediate(value),
-        });
+    // Header form: an x-amz-checksum-<algo> value s3s parsed onto the input.
+    // Every algorithm has its own typed field; checked in a fixed order because
+    // a well-formed request carries at most one.
+    let header_form = [
+        (ChecksumAlgorithm::Crc32, &input.checksum_crc32),
+        (ChecksumAlgorithm::Crc32c, &input.checksum_crc32c),
+        (ChecksumAlgorithm::Sha1, &input.checksum_sha1),
+        (ChecksumAlgorithm::Sha256, &input.checksum_sha256),
+        (ChecksumAlgorithm::Crc64Nvme, &input.checksum_crc64nvme),
+    ];
+    for (algorithm, field) in header_form {
+        if let Some(value) = field.clone() {
+            return Some(PutChecksum {
+                algorithm,
+                expected: Expected::Immediate(value),
+            });
+        }
     }
 
     // Trailer form: the value is not a header, so it can only be read once the
@@ -130,7 +131,7 @@ pub(crate) fn detect(
     let handle = trailing?;
     let declared = headers.get(&X_AMZ_TRAILER)?.to_str().ok()?;
     // `x-amz-trailer` is a comma-separated list in principle; take the first
-    // entry that is a checksum trailer for an algorithm aks3 computes.
+    // entry that is a checksum trailer for a known S3 algorithm.
     for token in declared.split(',') {
         let token = token.trim();
         let Some(algo_name) = token.strip_prefix(CHECKSUM_TRAILER_PREFIX) else {
@@ -153,30 +154,81 @@ pub(crate) fn detect(
     None
 }
 
-/// A body corrupted or misdescribed on upload: the computed checksum did not
-/// match the one the client supplied. Carried inside an [`std::io::Error`] so it
-/// can travel out through the engine's stream-error path and be recognised by
-/// [`put_error`].
-#[derive(Debug)]
-struct ChecksumMismatch {
-    algorithm: ChecksumAlgorithm,
+/// A checksum a `PutObject` requested but that could not be honoured as sent.
+///
+/// Carried inside an [`std::io::Error`] so it can travel out through the engine's
+/// stream-error path and be recognised by [`put_error`]. Both variants mean the
+/// same thing to the invariant: a checksum was asked for and the upload must not
+/// be stored on faith, so both become a 400.
+#[derive(Debug, PartialEq, Eq)]
+enum ChecksumError {
+    /// The computed checksum did not match the value the client supplied.
+    Mismatch { algorithm: ChecksumAlgorithm },
+    /// A checksum was requested via an aws-chunked trailer, but no trailer value
+    /// arrived to check the body against.
+    MissingTrailer { algorithm: ChecksumAlgorithm },
 }
 
-impl std::fmt::Display for ChecksumMismatch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} checksum mismatch", self.algorithm.as_str())
+impl ChecksumError {
+    fn algorithm(&self) -> ChecksumAlgorithm {
+        match self {
+            Self::Mismatch { algorithm } | Self::MissingTrailer { algorithm } => *algorithm,
+        }
     }
 }
 
-impl std::error::Error for ChecksumMismatch {}
+impl std::fmt::Display for ChecksumError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mismatch { algorithm } => write!(f, "{} checksum mismatch", algorithm.as_str()),
+            Self::MissingTrailer { algorithm } => {
+                write!(
+                    f,
+                    "{} checksum trailer declared but not sent",
+                    algorithm.as_str()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChecksumError {}
+
+/// Decide the outcome of a verification once the body has been consumed.
+///
+/// `computed` is the value aks3 calculated over the body; `expected` is the value
+/// the client supplied, which is `None` only when a trailer was declared but no
+/// value arrived (an immediate header value is always `Some`). Any requested
+/// checksum that cannot be confirmed equal is an error, so the missing case is
+/// rejected rather than passed: this is the invariant that no requested checksum
+/// is ever stored unverified.
+fn evaluate(
+    algorithm: ChecksumAlgorithm,
+    computed: Option<String>,
+    expected: Option<String>,
+) -> Option<ChecksumError> {
+    match (computed, expected) {
+        (Some(computed), Some(expected)) if computed != expected => {
+            Some(ChecksumError::Mismatch { algorithm })
+        }
+        (Some(_), None) => Some(ChecksumError::MissingTrailer { algorithm }),
+        _ => None,
+    }
+}
 
 /// A body stream that verifies the client's checksum as it passes.
 ///
 /// Each chunk is folded into a running checksum on its way to the engine. When
 /// the inner stream ends, the running value is compared with the expected one;
-/// on a mismatch the stream yields an error carrying [`ChecksumMismatch`], which
-/// aborts the engine before it commits. When they match (or no expected value
-/// arrived) the stream simply ends, and the engine stores the object.
+/// on a mismatch (or a declared trailer that never arrived) the stream yields an
+/// error carrying [`ChecksumError`], which aborts the engine before it commits.
+/// When they match the stream simply ends, and the engine stores the object.
+///
+/// The engine computes the same checksum a second time, to store it, because it
+/// cannot see the aws-chunked trailer this layer verifies against. That is one
+/// extra hash over a body that is read once either way; unifying the two would
+/// mean the engine reaching into s3s, which the layer boundary forbids. Tracked
+/// as a possible future refinement, not a correctness issue.
 pub(crate) struct VerifyingStream {
     inner: aks3_engine::BoxByteStream,
     algorithm: ChecksumAlgorithm,
@@ -225,13 +277,9 @@ impl Stream for VerifyingStream {
                 this.finished = true;
                 let computed = this.checksummer.take().map(Checksummer::finalize_base64);
                 let expected = this.expected.take().and_then(Expected::resolve);
-                match (computed, expected) {
-                    (Some(computed), Some(expected)) if computed != expected => {
-                        Poll::Ready(Some(Err(std::io::Error::other(ChecksumMismatch {
-                            algorithm: this.algorithm,
-                        }))))
-                    }
-                    _ => Poll::Ready(None),
+                match evaluate(this.algorithm, computed, expected) {
+                    Some(err) => Poll::Ready(Some(Err(std::io::Error::other(err)))),
+                    None => Poll::Ready(None),
                 }
             }
         }
@@ -240,21 +288,32 @@ impl Stream for VerifyingStream {
 
 /// Turn a failed `PutObject` into the S3 error a client should see.
 ///
-/// A checksum mismatch surfaces as an [`EngineError::Io`] wrapping
-/// [`ChecksumMismatch`], because [`VerifyingStream`] fails the body stream to
-/// abort the upload. That one case becomes `400 BadDigest`; everything else is
-/// an ordinary engine failure and goes through [`map_engine_err`].
+/// A verification failure surfaces as an [`EngineError::Io`] wrapping a
+/// [`ChecksumError`], because [`VerifyingStream`] fails the body stream to abort
+/// the upload before it commits. A value mismatch becomes `400 BadDigest`, the
+/// code AWS uses when a supplied checksum does not match; a declared-but-missing
+/// trailer becomes `400 InvalidRequest`, since the request, not the digest, is
+/// malformed. Everything else is an ordinary engine failure and goes through
+/// [`map_engine_err`].
 pub(crate) fn put_error(err: EngineError) -> S3Error {
     if let EngineError::Io(ref io) = err {
-        if let Some(mismatch) = io
+        if let Some(checksum_err) = io
             .get_ref()
-            .and_then(|source| source.downcast_ref::<ChecksumMismatch>())
+            .and_then(|source| source.downcast_ref::<ChecksumError>())
         {
-            return s3_error!(
-                BadDigest,
-                "The {} checksum you specified did not match the checksum of the object received.",
-                mismatch.algorithm.as_str()
-            );
+            let algorithm = checksum_err.algorithm().as_str();
+            return match checksum_err {
+                ChecksumError::Mismatch { .. } => s3_error!(
+                    BadDigest,
+                    "The {algorithm} checksum you specified did not match the checksum of the \
+                     object received."
+                ),
+                ChecksumError::MissingTrailer { .. } => s3_error!(
+                    InvalidRequest,
+                    "A {algorithm} checksum trailer was declared with x-amz-trailer but no \
+                     trailing checksum was sent."
+                ),
+            };
         }
     }
     map_engine_err(err)
@@ -268,8 +327,10 @@ pub(crate) fn put_error(err: EngineError) -> S3Error {
 /// no multipart upload.
 pub(crate) struct ChecksumFields {
     pub crc32: Option<String>,
+    pub crc32c: Option<String>,
     pub sha1: Option<String>,
     pub sha256: Option<String>,
+    pub crc64nvme: Option<String>,
     pub checksum_type: Option<ChecksumType>,
 }
 
@@ -278,15 +339,20 @@ pub(crate) struct ChecksumFields {
 pub(crate) fn fields_for(stored: Option<&StoredChecksum>) -> ChecksumFields {
     let mut fields = ChecksumFields {
         crc32: None,
+        crc32c: None,
         sha1: None,
         sha256: None,
+        crc64nvme: None,
         checksum_type: None,
     };
     if let Some(stored) = stored {
+        let value = Some(stored.value.clone());
         match stored.algorithm {
-            ChecksumAlgorithm::Crc32 => fields.crc32 = Some(stored.value.clone()),
-            ChecksumAlgorithm::Sha1 => fields.sha1 = Some(stored.value.clone()),
-            ChecksumAlgorithm::Sha256 => fields.sha256 = Some(stored.value.clone()),
+            ChecksumAlgorithm::Crc32 => fields.crc32 = value,
+            ChecksumAlgorithm::Crc32c => fields.crc32c = value,
+            ChecksumAlgorithm::Sha1 => fields.sha1 = value,
+            ChecksumAlgorithm::Sha256 => fields.sha256 = value,
+            ChecksumAlgorithm::Crc64Nvme => fields.crc64nvme = value,
         }
         fields.checksum_type = Some(ChecksumType::from_static(ChecksumType::FULL_OBJECT));
     }
@@ -355,10 +421,12 @@ mod tests {
             .await
             .expect_err("mismatch must fail the stream");
         assert!(
-            err.get_ref()
-                .and_then(|s| s.downcast_ref::<ChecksumMismatch>())
-                .is_some(),
-            "the failure must carry a ChecksumMismatch so put_error can map it"
+            matches!(
+                err.get_ref()
+                    .and_then(|s| s.downcast_ref::<ChecksumError>()),
+                Some(ChecksumError::Mismatch { .. })
+            ),
+            "the failure must carry a ChecksumError::Mismatch so put_error can map it"
         );
     }
 
@@ -366,8 +434,10 @@ mod tests {
     async fn every_algorithm_verifies() {
         for algorithm in [
             ChecksumAlgorithm::Crc32,
+            ChecksumAlgorithm::Crc32c,
             ChecksumAlgorithm::Sha1,
             ChecksumAlgorithm::Sha256,
+            ChecksumAlgorithm::Crc64Nvme,
         ] {
             let good = checksum_of(algorithm, b"payload");
             let ok = VerifyingStream::new(body(&[b"payload"]), immediate(algorithm, &good));
@@ -399,18 +469,48 @@ mod tests {
         let err = drive(stream).await.expect_err("inner error propagates");
         assert!(err
             .get_ref()
-            .and_then(|s| s.downcast_ref::<ChecksumMismatch>())
+            .and_then(|s| s.downcast_ref::<ChecksumError>())
             .is_none());
     }
 
     #[test]
+    fn evaluate_matches_mismatches_and_missing_trailers() {
+        // Equal values verify.
+        assert!(evaluate(ChecksumAlgorithm::Crc32, Some("a".into()), Some("a".into())).is_none());
+        // Different values are a mismatch.
+        assert_eq!(
+            evaluate(ChecksumAlgorithm::Crc32, Some("a".into()), Some("b".into())),
+            Some(ChecksumError::Mismatch {
+                algorithm: ChecksumAlgorithm::Crc32
+            })
+        );
+        // A requested checksum whose expected value never arrived (declared
+        // trailer, no trailer sent) must not pass unverified.
+        assert_eq!(
+            evaluate(ChecksumAlgorithm::Sha256, Some("a".into()), None),
+            Some(ChecksumError::MissingTrailer {
+                algorithm: ChecksumAlgorithm::Sha256
+            })
+        );
+    }
+
+    #[test]
     fn put_error_maps_a_mismatch_to_bad_digest() {
-        let io = std::io::Error::other(ChecksumMismatch {
+        let io = std::io::Error::other(ChecksumError::Mismatch {
             algorithm: ChecksumAlgorithm::Sha256,
         });
         let err = put_error(EngineError::Io(io));
         assert_eq!(*err.code(), S3ErrorCode::BadDigest);
         assert!(err.message().is_some_and(|m| m.contains("SHA256")));
+    }
+
+    #[test]
+    fn put_error_maps_a_missing_trailer_to_invalid_request() {
+        let io = std::io::Error::other(ChecksumError::MissingTrailer {
+            algorithm: ChecksumAlgorithm::Crc32,
+        });
+        let err = put_error(EngineError::Io(io));
+        assert_eq!(*err.code(), S3ErrorCode::InvalidRequest);
     }
 
     #[test]
@@ -438,14 +538,29 @@ mod tests {
     }
 
     #[test]
-    fn detect_leaves_crt_algorithms_on_the_pass_through() {
-        // CRC32C is present on the input but aks3 does not compute it, so detect
-        // returns None and the value is neither verified nor stored.
-        let input = PutObjectInput {
+    fn detect_finds_crt_algorithms_too() {
+        // CRC32C and CRC64NVME are verified server-side now, so detect must find
+        // them: a client that opts into one gets verification, not a silent 200.
+        let crc32c = PutObjectInput {
             checksum_crc32c: Some("value".to_owned()),
             ..Default::default()
         };
-        assert!(detect(&input, &HeaderMap::new(), None).is_none());
+        assert_eq!(
+            detect(&crc32c, &HeaderMap::new(), None)
+                .expect("crc32c")
+                .algorithm,
+            ChecksumAlgorithm::Crc32c
+        );
+        let crc64 = PutObjectInput {
+            checksum_crc64nvme: Some("value".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            detect(&crc64, &HeaderMap::new(), None)
+                .expect("crc64nvme")
+                .algorithm,
+            ChecksumAlgorithm::Crc64Nvme
+        );
     }
 
     #[test]

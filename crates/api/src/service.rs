@@ -389,8 +389,10 @@ impl<L: ObjectLayer> s3s::S3 for Aks3<L> {
         Ok(S3Response::new(PutObjectOutput {
             e_tag: Some(ETag::Strong(info.etag)),
             checksum_crc32: fields.crc32,
+            checksum_crc32c: fields.crc32c,
             checksum_sha1: fields.sha1,
             checksum_sha256: fields.sha256,
+            checksum_crc64nvme: fields.crc64nvme,
             checksum_type: fields.checksum_type,
             ..Default::default()
         }))
@@ -443,8 +445,10 @@ impl<L: ObjectLayer> s3s::S3 for Aks3<L> {
             last_modified: Some(Timestamp::from(epoch_ms_to_systemtime(mtime_epoch_ms))),
             metadata: Some(user_metadata.into_iter().collect()),
             checksum_crc32: fields.crc32,
+            checksum_crc32c: fields.crc32c,
             checksum_sha1: fields.sha1,
             checksum_sha256: fields.sha256,
+            checksum_crc64nvme: fields.crc64nvme,
             checksum_type: fields.checksum_type,
             ..Default::default()
         }))
@@ -485,8 +489,10 @@ impl<L: ObjectLayer> s3s::S3 for Aks3<L> {
             last_modified: Some(Timestamp::from(epoch_ms_to_systemtime(mtime_epoch_ms))),
             metadata: Some(user_metadata.into_iter().collect()),
             checksum_crc32: fields.crc32,
+            checksum_crc32c: fields.crc32c,
             checksum_sha1: fields.sha1,
             checksum_sha256: fields.sha256,
+            checksum_crc64nvme: fields.crc64nvme,
             checksum_type: fields.checksum_type,
             ..Default::default()
         }))
@@ -797,8 +803,10 @@ mod tests {
         };
         match algorithm {
             ChecksumAlgorithm::Crc32 => input.checksum_crc32 = Some(value.to_owned()),
+            ChecksumAlgorithm::Crc32c => input.checksum_crc32c = Some(value.to_owned()),
             ChecksumAlgorithm::Sha1 => input.checksum_sha1 = Some(value.to_owned()),
             ChecksumAlgorithm::Sha256 => input.checksum_sha256 = Some(value.to_owned()),
+            ChecksumAlgorithm::Crc64Nvme => input.checksum_crc64nvme = Some(value.to_owned()),
         }
         req(input)
     }
@@ -914,8 +922,10 @@ mod tests {
         s.create_bucket(create("buk")).await.expect("create");
         for algorithm in [
             ChecksumAlgorithm::Crc32,
+            ChecksumAlgorithm::Crc32c,
             ChecksumAlgorithm::Sha1,
             ChecksumAlgorithm::Sha256,
+            ChecksumAlgorithm::Crc64Nvme,
         ] {
             let key = algorithm.as_str();
             let value = checksum_of(algorithm, b"hello world");
@@ -926,8 +936,10 @@ mod tests {
             let got = s.get_object(get_checked(key)).await.expect("get").output;
             let returned = match algorithm {
                 ChecksumAlgorithm::Crc32 => got.checksum_crc32,
+                ChecksumAlgorithm::Crc32c => got.checksum_crc32c,
                 ChecksumAlgorithm::Sha1 => got.checksum_sha1,
                 ChecksumAlgorithm::Sha256 => got.checksum_sha256,
+                ChecksumAlgorithm::Crc64Nvme => got.checksum_crc64nvme,
             };
             assert_eq!(
                 returned.as_deref(),
@@ -939,20 +951,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_wrong_sha256_is_also_rejected() {
+    async fn a_wrong_checksum_is_rejected_for_every_algorithm() {
+        // Every algorithm, CRC32C and CRC64NVME included: a wrong value is a 400
+        // and stores nothing. This is the invariant that closes the silent-accept
+        // gap for the CRT algorithms a client can opt into.
         let (_d, s) = svc().await;
         s.create_bucket(create("buk")).await.expect("create");
-        let wrong = checksum_of(ChecksumAlgorithm::Sha256, b"a different body");
-        let err = s
-            .put_object(put_checksummed(
-                "k",
-                b"hello world",
-                ChecksumAlgorithm::Sha256,
-                &wrong,
-            ))
-            .await
-            .expect_err("a wrong sha256 must be refused");
-        assert_eq!(*err.code(), S3ErrorCode::BadDigest);
+        for algorithm in [
+            ChecksumAlgorithm::Crc32,
+            ChecksumAlgorithm::Crc32c,
+            ChecksumAlgorithm::Sha1,
+            ChecksumAlgorithm::Sha256,
+            ChecksumAlgorithm::Crc64Nvme,
+        ] {
+            let key = algorithm.as_str();
+            let wrong = checksum_of(algorithm, b"a different body");
+            let err = s
+                .put_object(put_checksummed(key, b"hello world", algorithm, &wrong))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{} wrong value must be refused", algorithm.as_str()));
+            assert_eq!(
+                *err.code(),
+                S3ErrorCode::BadDigest,
+                "{}",
+                algorithm.as_str()
+            );
+
+            // And nothing was stored under that key.
+            let get_err = s
+                .get_object(get(key))
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{} key must be absent", algorithm.as_str()));
+            assert_eq!(
+                *get_err.code(),
+                S3ErrorCode::NoSuchKey,
+                "{}",
+                algorithm.as_str()
+            );
+        }
     }
 
     /// Drain a response body to the bytes it carried.
