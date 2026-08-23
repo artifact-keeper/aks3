@@ -53,6 +53,18 @@ def test_real_select():
     client = get_client()
     resp = client.select_object_content(Bucket="b", Key="k")
     assert resp is not None
+
+
+def test_delegates_via_return():
+    # First statement is `return <expr>`: the return expression IS the test, so
+    # this is a genuine test, not a stub, and must never be dropped.
+    return get_client().select_object_content(Bucket="b", Key="k")
+
+
+def test_docstring_then_assert():
+    """A docstring, then real work: a genuine test."""
+    resp = get_client().list_buckets()
+    assert resp is not None
 PYSRC
 
 cat > "$WORK/suite/s3tests/functional/test_utils.py" <<'PYSRC'
@@ -197,6 +209,18 @@ else
   echo "FAIL suppressed candidates or their reasons missing from the delta"
   failures=$((failures + 1))
 fi
+
+# True negative for the stub guard: a test whose first statement is
+# `return <expr>` is a delegation test, not a stub. The return value IS the
+# test, so it must survive the filter.
+write_report "$WORK/delegate.xml" "pass:$SEL:test_delegates_via_return:$SELF"
+check "return-expression test is kept" "$WORK/delegate.xml" "$WORK/nolist.txt" \
+  passing=1 promotions=1 suppressed=0 regressions=0
+
+# Symmetric control: a docstring followed by real work is genuine, not a stub.
+write_report "$WORK/docwork.xml" "pass:$SEL:test_docstring_then_assert:$SELF"
+check "docstring-then-work test is kept" "$WORK/docwork.xml" "$WORK/nolist.txt" \
+  passing=1 promotions=1 suppressed=0 regressions=0
 
 # A candidate whose source cannot be found or whose function cannot be located
 # is kept, not dropped: the filter only removes tests it positively recognises

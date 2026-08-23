@@ -234,7 +234,14 @@ def is_leading_return(func):
         and isinstance(body[0].value.value, str)
     ):
         idx = 1
-    return idx < len(body) and isinstance(body[idx], ast.Return)
+    # Only a bare valueless `return` is a stub. `return client.call(...)` is a
+    # delegation test whose return expression IS the test, so a value-carrying
+    # return must never be dropped. Both #35 stubs are bare returns (value None).
+    return (
+        idx < len(body)
+        and isinstance(body[idx], ast.Return)
+        and body[idx].value is None
+    )
 
 
 def reason(node_id):
