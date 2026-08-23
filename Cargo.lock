@@ -64,6 +64,8 @@ dependencies = [
  "aks3-iam",
  "anyhow",
  "aws-sdk-s3",
+ "bytes",
+ "futures",
  "hyper",
  "hyper-util",
  "rustls-pemfile",

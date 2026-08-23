@@ -32,6 +32,11 @@ tracing-subscriber = { workspace = true }
 # modern replacement and is already in the default set.
 aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 tempfile = { workspace = true }
+# The crash harness drives the engine directly, and the engine speaks in
+# `futures` streams of `bytes::Bytes`. Both are already workspace dependencies
+# that the engine itself pulls in, so neither adds anything to the build.
+futures = { workspace = true }
+bytes = { workspace = true }
 
 [lints]
 workspace = true
