@@ -31,8 +31,23 @@ jobs:
       # prints why it is skipping and passes, which is what keeps
       # `cargo test --workspace` runnable without sudo everywhere else.
       - run: tests/enospc/setup-loopback.sh
+      # AKS3_ENOSPC_REQUIRED turns the leg's skip into a failure. The mount
+      # exists by the time this runs, so a skip here means the wiring broke, and
+      # a skipped leg that passes looks exactly like a leg that ran.
       - run: cargo test --workspace
-        env: { PROPTEST_CASES: "1024", AKS3_ENOSPC_DIR: /mnt/aks3-enospc }
+        env:
+          PROPTEST_CASES: "1024"
+          AKS3_ENOSPC_DIR: /mnt/aks3-enospc
+          AKS3_ENOSPC_REQUIRED: "1"
+      # Before the teardown, because the crash harness archives the post-crash
+      # store under the target directory and a disk-full failure would otherwise
+      # destroy its own evidence when the filesystem holding it is unmounted.
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: crash-artifacts
+          path: target/tmp/crash-artifacts/
+          if-no-files-found: ignore
       # Even when the tests failed: a loop device and a mount left behind
       # outlive the job on a self-hosted runner, and cost nothing to release on
       # a hosted one.
