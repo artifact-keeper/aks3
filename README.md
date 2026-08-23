@@ -11,6 +11,15 @@ tests from the ceph/s3-tests suite, listed in `tests/compliance/allowlist.txt`
 and enforced on every change; the list is small because the suite's teardown
 needs operations Phase 0 does not have yet, and growing it is the roadmap.
 
+Alongside it, `tests/compliance/boto3-tests/` drives the same server with a
+current boto3 and gates on that too. It covers the ground s3-tests does not:
+the integrity checksums the AWS SDKs have sent by default since January 2025,
+in both the header and the aws-chunked trailer form, along with presigned URLs
+and the response shapes an SDK parses rather than a status code. aks3 accepts
+those checksums today but does not verify or store them, and each place that
+diverges from AWS is named in a test rather than left to be found in
+production.
+
 ## Origin and license
 
 aks3 is licensed under the GNU Affero General Public License v3.0 only. The full

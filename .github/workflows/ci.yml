@@ -67,9 +67,12 @@ jobs:
         if: always()
       - uses: EmbarkStudios/cargo-deny-action@v2
 
-  # Runs the allowlisted subset of ceph/s3-tests against a real aks3 process.
-  # The allowlist is the gate: a change that breaks one of those behaviours
-  # fails here rather than in whatever client hits it first.
+  # Runs two suites against one real aks3 process: the allowlisted subset of
+  # ceph/s3-tests, and the boto3 golden paths in tests/compliance/boto3-tests.
+  # Both are gates. The allowlist pins the wire format s3-tests describes; the
+  # boto3 suite covers what it does not, which is what a current SDK actually
+  # sends, integrity checksums included. A change that breaks either fails here
+  # rather than in whatever client hits it first.
   compliance:
     runs-on: ubuntu-latest
     # Same reasoning as the check job's: this one spawns a server and waits on

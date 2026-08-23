@@ -7,11 +7,12 @@
 # Runs ceph/s3-tests against a freshly built aks3, in one of two modes.
 #
 # By default it runs the allowlisted subset and gates on it: every listed test
-# must run and pass. With --full it runs the whole suite instead and reports
-# rather than gates, which is what the nightly recon does to find tests that
-# have started passing without anyone noticing. Both modes share this file
-# rather than a copy of it, so the thing the recon measures cannot drift from
-# the thing the gate enforces.
+# must run and pass, and then the boto3 golden-path suite in boto3-tests/ runs
+# against the same server and gates too. With --full it runs the whole ceph
+# suite instead and reports rather than gates, which is what the nightly recon
+# does to find tests that have started passing without anyone noticing. Both
+# modes share this file rather than a copy of it, so the thing the recon
+# measures cannot drift from the thing the gate enforces.
 #
 # The store, the config and the server all live for the length of this script
 # and nothing else: a compliance run that inherited state from the last one
@@ -53,6 +54,13 @@ S3_TESTS_REF="5522d1c351f75bc00ae0f64f742f3f095f5939d9"
 # Port the server under test listens on. Substituted into the config template,
 # so the two cannot drift.
 PORT=19000
+
+# The root credential the server is started with. s3tests.conf.in carries the
+# same pair for the compliance suite; the boto3 suite reads it out of the
+# environment, which is why it is a variable here rather than a literal in the
+# config heredoc below.
+ROOT_ACCESS_KEY=s3testsroot
+ROOT_SECRET_KEY=s3testsrootsecret
 
 # Per-test limit in --full mode. The suite is written against servers that
 # implement everything it asks for, and a request aks3 answers in a way some
@@ -108,8 +116,8 @@ cargo build --release --manifest-path "$ROOT/Cargo.toml" -p aks3-server
 cat > "$DATA/aks3.toml" <<EOF
 listen = "127.0.0.1:$PORT"
 data_dir = "$DATA/store"
-root_access_key = "s3testsroot"
-root_secret_key = "s3testsrootsecret"
+root_access_key = "$ROOT_ACCESS_KEY"
+root_secret_key = "$ROOT_SECRET_KEY"
 EOF
 
 # The server logs a line per rejected request, and the allowlist is mostly
@@ -312,6 +320,35 @@ else
     status=1
   fi
 fi
+
+# The boto3 golden paths, against the same server, in the same virtualenv.
+#
+# Same server because spawning a second one would double the job's slowest step
+# to test the same binary, and the standing constraint is that no end-to-end job
+# runs a release build of its own. Same virtualenv because the lockfile beside
+# this script already pins boto3: the suite needs a checksum-era SDK, and this
+# is where the version of it is decided.
+#
+# It runs after the gate arithmetic rather than instead of it, and its result is
+# folded into the same status, so a run that breaks both reports both rather
+# than stopping at whichever came first. Its own buckets are prefixed and
+# cleaned up by its fixtures, and the compliance suite's are prefixed
+# differently, so the order the two run in does not matter.
+#
+# Only in gate mode. --full is the nightly recon, which reports rather than
+# gates and exits 0 whatever happened; a gate whose failures are discarded is
+# worse than one that did not run, and every bump that could break this suite
+# arrives as a pull request anyway.
+echo "--- boto3 golden paths ---"
+AKS3_ENDPOINT="http://127.0.0.1:$PORT" \
+AKS3_ACCESS_KEY="$ROOT_ACCESS_KEY" \
+AKS3_SECRET_KEY="$ROOT_SECRET_KEY" \
+  python -m pytest -q --no-header -p no:cacheprovider "$COMPLIANCE_DIR/boto3-tests" || status=1
+
+# Asked again for the same reason it is asked after the compliance suite: a
+# server that died during the boto3 run turns its failures into a report about
+# a process that was not there.
+require_server_alive "after the boto3 suite"
 
 if [ "$status" -ne 0 ]; then
   echo "--- aks3 server log ---" >&2
