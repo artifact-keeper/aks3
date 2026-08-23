@@ -99,14 +99,46 @@ def test_deleting_a_missing_key_succeeds(s3, bucket):
     assert response["ResponseMetadata"]["HTTPStatusCode"] == 204
 
 
-def test_an_illegal_bucket_name(s3):
-    """Rejected by the server, with a code, not by an unhandled 500.
+def test_a_bucket_name_s3s_rejects_has_a_code_but_no_message(s3):
+    """A name the s3s layer rejects while parsing the path: code, status, no message.
 
-    boto3 does not validate bucket names client-side for a custom endpoint, so
-    this really does reach the server.
+    "A" fails s3s's own AwsNameValidation (uppercase) as the request path is
+    still being parsed, before create_bucket runs. s3s answers with a bare
+    InvalidBucketName and no Message, so aks3's map_engine_err, which is the
+    layer that attaches the human-readable wording, never runs for a name s3s
+    itself refuses. This path therefore asserts only the code and the status a
+    caller branches on, and deliberately makes no message assertion: there is no
+    message to assert, and producing one is s3s's behaviour to own rather than
+    aks3's. boto3 does not validate bucket names client-side against a custom
+    endpoint, so "A" really does reach the server.
+
+    The complementary case, a name s3s accepts but aks3's engine rejects, is
+    test_a_bucket_name_the_engine_rejects_carries_a_message below. That is where
+    the message wording is reachable and pinned.
     """
     with pytest.raises(ClientError) as err:
         s3.create_bucket(Bucket="A")
+
+    assert err.value.response["Error"]["Code"] == "InvalidBucketName"
+    assert err.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+def test_a_bucket_name_the_engine_rejects_carries_a_message(s3):
+    """A name s3s accepts but aks3's engine rejects: code, status and message.
+
+    "999.999.999.999" passes s3s's AwsNameValidation, which rejects only names
+    that parse as a real IP address, and this one does not, since 999 is out of
+    range for an octet. So the request gets past path parsing and reaches
+    create_bucket, where aks3's own validator rejects it: aks3 treats an
+    IPv4-shaped name (four dotted groups of decimal digits) as invalid on shape
+    alone, without checking whether the groups are in range, which is stricter
+    than s3s here. That rejection returns EngineError::InvalidBucketName, which
+    map_engine_err turns into the wire error, and map_engine_err is the layer
+    that attaches the message. So this is the path on which the message is
+    actually produced, and the right place to pin its exact wording.
+    """
+    with pytest.raises(ClientError) as err:
+        s3.create_bucket(Bucket="999.999.999.999")
 
     assert err.value.response["Error"]["Code"] == "InvalidBucketName"
     assert err.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
