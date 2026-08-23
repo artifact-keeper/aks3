@@ -542,3 +542,245 @@ mod tests {
         assert_eq!(p.components().count(), 4);
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    //! The same claims as the examples above, over the whole input space.
+    //!
+    //! The examples stay: they are readable documentation of what the encoding
+    //! does to a particular byte. These say that nothing else can happen.
+    //!
+    //! A failure prints its minimal input together with a `cc <seed>` line for
+    //! `crates/engine/proptest-regressions/paths.txt`; see the README there.
+
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Fragments picked to land on the encoding's decisions: escape markers,
+    /// the three components rule 3 rewrites whole, near misses of the reserved
+    /// prefix, and bytes the filesystem cares about.
+    ///
+    /// Uniform random strings almost never contain a `%` or spell `__aks3`, so
+    /// without this alphabet the interesting half of the input space would be
+    /// unreachable.
+    fn confusable() -> impl Strategy<Value = String> {
+        let atoms = prop::sample::select(vec![
+            "",
+            "%",
+            "%2",
+            "%25",
+            "%2E",
+            "%2F",
+            "%2f",
+            "%5F",
+            ".",
+            "..",
+            "\\",
+            "_",
+            "__",
+            "__aks3",
+            "__aks",
+            "_aks3",
+            META_FILE,
+            "a",
+            "\u{0}",
+            "\u{1f}",
+            "\u{7f}",
+            "caf\u{e9}",
+            "\u{1f600}",
+        ]);
+        prop::collection::vec(atoms, 0..5).prop_map(|parts| parts.concat())
+    }
+
+    /// One `/`-free key component, which is what [`encode_component`] is
+    /// contracted for.
+    ///
+    /// Slashes are dropped rather than filtered out so that no case is
+    /// rejected: a `/` is what [`key_to_rel_path`] splits on, so it never
+    /// reaches [`encode_component`] in the first place.
+    fn component() -> impl Strategy<Value = String> {
+        prop_oneof![
+            3 => confusable(),
+            2 => any::<String>(),
+            1 => "(?s).{0,12}",
+        ]
+        .prop_map(|s| s.replace('/', ""))
+    }
+
+    /// A whole S3 key. Empty components are in range, so leading, trailing and
+    /// doubled separators all occur.
+    fn key() -> impl Strategy<Value = String> {
+        prop::collection::vec(component(), 1..5).prop_map(|parts| parts.join("/"))
+    }
+
+    /// Names as they might be read back off a hostile or corrupt volume.
+    fn on_disk_name() -> impl Strategy<Value = String> {
+        prop_oneof![
+            2 => confusable(),
+            1 => any::<String>(),
+            1 => "(?s)[%0-9A-Za-z]{0,10}",
+        ]
+    }
+
+    /// Version ids as a client can send them: anything at all.
+    fn version_id() -> impl Strategy<Value = String> {
+        prop_oneof![
+            2 => confusable(),
+            2 => "[A-Za-z0-9._/\\\\-]{0,12}",
+            1 => any::<String>(),
+        ]
+    }
+
+    /// Recover the version id [`data_file_name`] was called with, or `None` if
+    /// `name` is not something it could have produced.
+    ///
+    /// A left inverse, written out here rather than in the module because
+    /// nothing in aks3 needs to read a version id back off a file name; the
+    /// walk works from manifests. It exists so that injectivity can be asserted
+    /// over the whole id space instead of by drawing pairs.
+    ///
+    /// Its hex parsing is deliberately stricter than the module's own
+    /// [`hex_val`], which accepts either case. [`data_file_name`] emits
+    /// uppercase, and reusing the lenient parser would let a drift to lowercase
+    /// hex roundtrip cleanly and go unnoticed.
+    fn decode_data_file_name(name: &str) -> Option<String> {
+        fn upper_hex(b: u8) -> Option<u8> {
+            match b {
+                b'0'..=b'9' => Some(b - b'0'),
+                b'A'..=b'F' => Some(b - b'A' + 10),
+                _ => None,
+            }
+        }
+
+        let body = name.strip_prefix("__aks3.v.")?.strip_suffix(".data")?;
+        let bytes = body.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                let hi = upper_hex(*bytes.get(i + 1)?)?;
+                let lo = upper_hex(*bytes.get(i + 2)?)?;
+                out.push((hi << 4) | lo);
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).ok()
+    }
+
+    /// Version ids that satisfy [`is_valid_version_id`], including the shapes
+    /// aks3 actually mints.
+    fn well_formed_version_id() -> impl Strategy<Value = String> {
+        prop_oneof![
+            1 => Just("null".to_owned()),
+            1 => "[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}",
+            1 => "[A-Za-z0-9._-]{1,16}".prop_filter("must be well-formed", |s| is_valid_version_id(s)),
+        ]
+    }
+
+    proptest! {
+        /// Rules 1 to 4 are reversible: a component comes back byte for byte.
+        #[test]
+        fn a_component_survives_encoding(c in component()) {
+            prop_assert_eq!(decode_component(&encode_component(&c)), Ok(c));
+        }
+
+        /// The key-level roundtrip, over keys of any shape, and the structural
+        /// promise that goes with it: an encoded key is a relative path of
+        /// plain file names, so joining it onto a bucket directory cannot climb
+        /// out of one.
+        #[test]
+        fn a_key_survives_the_path_roundtrip(k in key()) {
+            let p = key_to_rel_path(&k);
+            prop_assert!(p.is_relative(), "{k:?} encoded to {p:?}");
+            for c in p.components() {
+                prop_assert!(matches!(c, Component::Normal(_)), "{k:?} encoded to {p:?}");
+            }
+            prop_assert_eq!(rel_path_to_key(&p), Ok(k));
+        }
+
+        /// Distinct keys never share a path, which is what stops one object
+        /// from landing on another's bytes.
+        ///
+        /// A corollary of the roundtrip above, asserted directly: the roundtrip
+        /// exhibits a left inverse of the encoding, and a function with a left
+        /// inverse is injective. Stating it separately costs nothing and names
+        /// the consequence that actually matters.
+        #[test]
+        fn distinct_keys_get_distinct_paths(a in key(), b in key()) {
+            prop_assume!(a != b);
+            prop_assert_ne!(key_to_rel_path(&a), key_to_rel_path(&b));
+        }
+
+        /// Rule 4: no user key, however it is spelled, encodes to a name aks3
+        /// keeps its own bookkeeping under.
+        #[test]
+        fn no_key_encodes_to_a_reserved_name(k in key()) {
+            for c in key_to_rel_path(&k).components() {
+                let name = c.as_os_str().to_string_lossy();
+                prop_assert!(
+                    !name.starts_with(RESERVED_PREFIX),
+                    "{k:?} encoded to the reserved name {name:?}"
+                );
+            }
+        }
+
+        /// Decoding is total: a corrupt directory entry is an `Err`, never a
+        /// panic, and never a component that would splice an extra separator
+        /// into the key it is reassembled into.
+        #[test]
+        fn decoding_an_arbitrary_name_is_an_error_at_worst(name in on_disk_name()) {
+            if let Ok(decoded) = decode_component(&name) {
+                prop_assert!(!decoded.contains('/'), "{name:?} decoded to {decoded:?}");
+            }
+        }
+
+        /// Whatever a client sends as `?versionId=`, the data file it names is
+        /// one plain file name inside the object directory.
+        #[test]
+        fn a_data_file_name_is_always_one_safe_component(id in version_id()) {
+            let name = data_file_name(&id);
+            prop_assert!(name.starts_with(RESERVED_PREFIX), "{id:?} produced {name:?}");
+            prop_assert!(name.strip_suffix(".data").is_some(), "{id:?} produced {name:?}");
+            let p = Path::new(&name);
+            prop_assert!(p.is_relative(), "{id:?} produced {name:?}");
+            let comps: Vec<_> = p.components().collect();
+            prop_assert_eq!(comps.len(), 1, "{:?} produced {:?}", id, comps);
+            prop_assert!(matches!(comps[0], Component::Normal(_)), "{id:?} produced {comps:?}");
+        }
+
+        /// A data file name says which version id it was built from, and only
+        /// that one. This is what makes the naming injective, so no version can
+        /// ever overwrite the bytes of another.
+        ///
+        /// Stated as a left inverse rather than by comparing pairs, because
+        /// pairs cannot say it: two independently drawn ids collide about once
+        /// in a million draws, so a pairwise property would pass at any case
+        /// count CI can afford without ever having tested the claim.
+        /// [`decode_data_file_name`] recovers the id from the name over the
+        /// whole space, which is the same claim and is checkable.
+        #[test]
+        fn a_data_file_name_names_exactly_its_version_id(id in version_id()) {
+            prop_assert_eq!(decode_data_file_name(&data_file_name(&id)), Some(id));
+        }
+
+        /// The pairwise reading of the same claim. Kept because it is the form
+        /// the module documents, not because it carries the evidence: see
+        /// above for why it cannot.
+        #[test]
+        fn data_file_names_are_injective(a in version_id(), b in version_id()) {
+            prop_assume!(a != b);
+            prop_assert_ne!(data_file_name(&a), data_file_name(&b));
+        }
+
+        /// The escaping exists for hostile input; an id aks3 minted is stored
+        /// under its own name.
+        #[test]
+        fn a_well_formed_version_id_is_never_escaped(id in well_formed_version_id()) {
+            prop_assert!(is_valid_version_id(&id), "generator produced {id:?}");
+            prop_assert_eq!(data_file_name(&id), format!("__aks3.v.{id}.data"));
+        }
+    }
+}

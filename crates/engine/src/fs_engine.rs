@@ -2742,3 +2742,179 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    //! Properties for the pure arithmetic behind ranged reads and listing.
+    //!
+    //! `resolve_range`, `start_bound` and `common_prefix_of` are private
+    //! helpers, and they are tested here, inside the module, rather than
+    //! through a `pub(crate)` shim: the shim would be a second signature to
+    //! keep in step, and the engine's public surface reaches this arithmetic
+    //! only through file IO, which would put a tempdir between the property and
+    //! the thing it is about.
+    //!
+    //! A failure prints its minimal input together with a `cc <seed>` line for
+    //! `crates/engine/proptest-regressions/fs_engine.txt`; see the README
+    //! there.
+
+    use super::*;
+    use proptest::prelude::*;
+
+    /// S3 range semantics spelled out one byte at a time: a range selects the
+    /// bytes of `0..size` it covers, and a range that selects nothing is
+    /// unsatisfiable.
+    ///
+    /// Deliberately naive. It asks the membership question per byte instead of
+    /// doing arithmetic, which is the whole point of comparing it against
+    /// `resolve_range`; that is also why the sizes it runs on stay small.
+    fn naive_range(range: ByteRange, size: u64) -> Option<(u64, u64)> {
+        let selected: Vec<u64> = (0..size)
+            .filter(|&i| match range {
+                // Both ends included, as HTTP's are.
+                ByteRange::FromTo(first, last) => i >= first && i <= last,
+                ByteRange::From(first) => i >= first,
+                // The last `n` bytes. `n` of 0 selects nothing at any size,
+                // since no index reaches `size`.
+                ByteRange::Suffix(n) => i >= size.saturating_sub(n),
+            })
+            .collect();
+        let first = *selected.first()?;
+        let last = *selected.last()?;
+        let len = u64::try_from(selected.len()).unwrap();
+        assert_eq!(last - first + 1, len, "a range selects a contiguous run");
+        Some((first, len))
+    }
+
+    /// Object sizes the model can afford to walk byte by byte, weighted toward
+    /// the empty and single-byte objects the arithmetic trips over.
+    fn size() -> impl Strategy<Value = u64> {
+        prop_oneof![
+            3 => 0_u64..=64,
+            1 => Just(0_u64),
+            1 => Just(1_u64),
+        ]
+    }
+
+    /// Range bounds covering those sizes, the region just past them, and the
+    /// extremes a client can put on the wire.
+    fn bound() -> impl Strategy<Value = u64> {
+        prop_oneof![
+            4 => 0_u64..=70,
+            1 => Just(u64::MAX),
+            1 => Just(u64::MAX - 1),
+        ]
+    }
+
+    fn byte_range() -> impl Strategy<Value = ByteRange> {
+        prop_oneof![
+            (bound(), bound()).prop_map(|(a, b)| ByteRange::FromTo(a, b)),
+            bound().prop_map(ByteRange::From),
+            bound().prop_map(ByteRange::Suffix),
+        ]
+    }
+
+    /// The same question `common_prefix_of` answers, asked by scanning: the
+    /// first place at or after `prefix_len` where `delimiter` starts, cut to
+    /// just past it.
+    fn naive_fold(key: &str, prefix_len: usize, delimiter: &str) -> Option<String> {
+        (prefix_len..=key.len())
+            .find(|&i| key.get(i..).is_some_and(|rest| rest.starts_with(delimiter)))
+            .map(|i| key[..i + delimiter.len()].to_owned())
+    }
+
+    /// Keys built from fragments that make delimiters common: uniform strings
+    /// would fold almost never.
+    fn fold_key() -> impl Strategy<Value = String> {
+        let atoms = prop::sample::select(vec!["", "a", "b", "/", "//", "XX", "X", "\u{1f600}"]);
+        prop::collection::vec(atoms, 0..6).prop_map(|parts| parts.concat())
+    }
+
+    /// A key together with one of its character boundaries, which is what a
+    /// matched prefix length always is.
+    fn key_and_boundary() -> impl Strategy<Value = (String, usize)> {
+        fold_key().prop_flat_map(|k| {
+            let boundaries: Vec<usize> = (0..=k.len()).filter(|&i| k.is_char_boundary(i)).collect();
+            (Just(k), prop::sample::select(boundaries))
+        })
+    }
+
+    fn delimiter() -> impl Strategy<Value = String> {
+        prop::sample::select(vec!["/", "XX", "X", "a", "", "\u{1f600}"])
+            .prop_map(std::borrow::ToOwned::to_owned)
+    }
+
+    /// Bounds drawn from a tiny alphabet so that ties and near-ties, where the
+    /// choice between the two actually matters, come up constantly.
+    fn list_bound() -> impl Strategy<Value = Option<String>> {
+        prop::option::of(prop_oneof![
+            3 => "[ab]{0,3}",
+            1 => any::<String>(),
+        ])
+    }
+
+    proptest! {
+        /// Ranged reads agree with the model on both halves of the answer: the
+        /// classification (readable or 416) and the bytes selected.
+        #[test]
+        fn resolve_range_matches_the_naive_model(size in size(), range in byte_range()) {
+            match (resolve_range(Some(range), size), naive_range(range, size)) {
+                (Ok(got), Some(want)) => prop_assert_eq!(got, want),
+                (Err(EngineError::InvalidRange), None) => {}
+                (got, want) => prop_assert!(
+                    false,
+                    "resolve_range({range:?}, {size}) = {got:?}, model = {want:?}"
+                ),
+            }
+        }
+
+        /// No range is the whole object, at every size, including the empty
+        /// object that every range is unsatisfiable on.
+        #[test]
+        fn no_range_reads_the_whole_object(size in size()) {
+            prop_assert_eq!(resolve_range(None, size).ok(), Some((0, size)));
+        }
+
+        /// Whatever comes back is inside the object. Run over the full u64
+        /// range rather than the model's small sizes, because what this catches
+        /// is the inclusive-bounds arithmetic overflowing near `u64::MAX`.
+        #[test]
+        fn a_resolved_range_never_leaves_the_object(size in any::<u64>(), range in byte_range()) {
+            if let Ok((offset, len)) = resolve_range(Some(range), size) {
+                prop_assert!(
+                    offset.checked_add(len).is_some_and(|end| end <= size),
+                    "{range:?} on {size} bytes resolved to offset {offset} len {len}"
+                );
+            }
+        }
+
+        /// Both bounds say "not before here", so the answer has to satisfy
+        /// both: it is the later of whichever are set.
+        #[test]
+        fn the_start_bound_is_the_later_of_whatever_is_set(
+            token in list_bound(),
+            after in list_bound(),
+        ) {
+            let p = ListParams {
+                continuation_token: token.clone(),
+                start_after: after.clone(),
+                ..Default::default()
+            };
+            let want = token.iter().chain(after.iter()).max().map(String::as_str);
+            prop_assert_eq!(start_bound(&p), want);
+        }
+
+        /// Folding agrees with a scan, and reports the form S3 does: a prefix
+        /// of the key ending with the delimiter.
+        #[test]
+        fn folding_matches_a_scan((key, at) in key_and_boundary(), delim in delimiter()) {
+            let got = common_prefix_of(&key, at, &delim);
+            prop_assert_eq!(got.clone(), naive_fold(&key, at, &delim));
+            if let Some(folded) = got {
+                prop_assert!(key.starts_with(&folded), "{key:?} folded to {folded:?}");
+                prop_assert!(folded.ends_with(&delim), "{key:?} folded to {folded:?}");
+                prop_assert!(folded.len() >= at, "{key:?} folded to {folded:?} before {at}");
+            }
+        }
+    }
+}

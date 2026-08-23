@@ -17,7 +17,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # PROPTEST_CASES is pinned rather than left to proptest's default so that
+      # what CI covers is a number in this file, not whatever the dependency
+      # ships. It is four times the default (256): the property suites cost
+      # about 0.6 s at this setting against 0.15 s at the default, which buys
+      # four times the inputs for a rounding error on a 3-minute job. A failing
+      # case prints a `cc <seed>` line to paste into the matching file under
+      # crates/engine/proptest-regressions/, so a CI-only failure is
+      # reproducible locally without rerunning at this count.
       - run: cargo test --workspace
+        env: { PROPTEST_CASES: "1024" }
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   # Runs the allowlisted subset of ceph/s3-tests against a real aks3 process.
