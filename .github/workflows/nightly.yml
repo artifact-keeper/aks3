@@ -1,0 +1,238 @@
+name: nightly
+
+# The tests that are worth running but not worth waiting for.
+#
+# The pull-request path is held to a few minutes, which puts a ceiling on how
+# much of anything sampled it can run: the crash harness gets forty iterations
+# there, and the compliance gate gets the eighteen tests on the allowlist rather
+# than the thousand in the suite. Neither number is the interesting one. This
+# workflow runs the interesting ones once a night, where an hour costs nothing
+# and nobody is waiting.
+#
+# Two jobs today. Everything else the testing plan schedules (LazyFS, s3s-e2e,
+# rclone, listing at scale, container upgrade, fd exhaustion) joins this file as
+# further jobs rather than claiming a workflow of its own: scheduled workflows
+# are budgeted, and a repository with nine of them has nine things to remember
+# to re-enable after a quiet couple of months.
+#
+# On which: GitHub disables scheduled workflows after sixty days without a push,
+# so workflow_dispatch is not only for impatience. It is also what turns the
+# thing back on, and what lets a change to this file be exercised the hour it
+# merges rather than the following morning. `quick` exists for exactly that.
+on:
+  schedule:
+    # Off the hour, and a different minute from the weekly image scan: a job
+    # scheduled at :00 queues behind every other job on GitHub scheduled at :00.
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+    inputs:
+      quick:
+        description: "Shrink everything sized for a nightly so a dispatch finishes in minutes"
+        type: boolean
+        default: false
+
+# One nightly at a time. Not cancel-in-progress: a dispatch made while the
+# scheduled run is halfway through the suite should wait rather than throw that
+# hour away.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # The dedupe key for the tracking issue, matched exactly. Changing this text
+  # orphans whatever issue is open under the old one.
+  ISSUE_TITLE: s3-tests promotion candidates
+
+jobs:
+  # Runs the whole pinned ceph/s3-tests suite and compares what passed against
+  # what the allowlist claims.
+  #
+  # The suite's own result is not a verdict: hundreds of these tests are meant
+  # to fail against a Phase 0 server, and a job that went red for that would be
+  # a job nobody looks at. What comes out instead is the difference between the
+  # two sets, filed as one standing issue. Tests that pass and are not on the
+  # list are promotion candidates, which is how the allowlist stays a ratchet
+  # instead of a snapshot of what somebody had time to add. Tests on the list
+  # that did not pass should be impossible, because the pull-request gate runs
+  # the same list, and that is why they fail this job outright.
+  s3-tests-recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.98" }
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      # Seconds, against fabricated reports, and the only check anything here
+      # gets of the arithmetic the tracking issue rests on. The input that would
+      # exercise it for real takes the rest of this job to produce.
+      - name: Check the delta arithmetic before trusting it
+        run: tests/compliance/recon-delta-selftest.sh
+
+      # pytest-timeout comes from the same lockfile the gate installs, and
+      # bounds any one test; timeout-minutes above bounds the job. Neither is
+      # the other's substitute: a suite of a thousand tests each a second short
+      # of the per-test limit would sail past it.
+      - name: Run the whole suite
+        env:
+          QUICK: ${{ inputs.quick }}
+        run: |
+          if [ "$QUICK" = "true" ]; then
+            tests/compliance/run-s3-tests.sh --full \
+              --junit "${RUNNER_TEMP}/pytest.xml" \
+              s3tests/functional/test_headers.py
+          else
+            tests/compliance/run-s3-tests.sh --full \
+              --junit "${RUNNER_TEMP}/pytest.xml"
+          fi
+
+      - name: Diff what passes against the allowlist
+        id: delta
+        env:
+          QUICK: ${{ inputs.quick }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # 900 against the 1053 the pinned revision collects: low enough that
+          # upstream deleting a module is not an outage, high enough that a
+          # suite which collapsed during collection cannot report an empty delta
+          # and close the standing issue on the strength of a run that never
+          # happened. Off for a quick dispatch, which collects about fifty tests
+          # on purpose.
+          floor=(--min-collected 900)
+          if [ "$QUICK" = "true" ]; then
+            floor=()
+          fi
+          tests/compliance/recon-delta.sh \
+            --junit "${RUNNER_TEMP}/pytest.xml" \
+            --allowlist tests/compliance/allowlist.txt \
+            --suite-root tests/compliance/s3-tests \
+            --body "${RUNNER_TEMP}/issue-body.md" \
+            --delta "${RUNNER_TEMP}/delta.txt" \
+            ${floor[@]+"${floor[@]}"} >> "$GITHUB_OUTPUT"
+          if [ "$QUICK" = "true" ]; then
+            {
+              echo "**Quick dispatch.** Only one module of the suite ran, so every allowlisted test in the rest of it counts as a regression below and none of it means anything. The pipeline running at all is what this proves."
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          cat "${RUNNER_TEMP}/issue-body.md" >> "$GITHUB_STEP_SUMMARY"
+
+      # The issue body lists at most a hundred node IDs. This is where the rest
+      # of them are, along with the report they came out of, which is what to
+      # look at when a promotion candidate turns out not to be one.
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: s3-tests-recon
+          path: |
+            ${{ runner.temp }}/pytest.xml
+            ${{ runner.temp }}/delta.txt
+          if-no-files-found: ignore
+
+      # Skipped for a quick dispatch, which runs one module of the suite: its
+      # delta describes a fraction of the picture and would rewrite the standing
+      # issue with it. The step summary above still shows what it would have
+      # filed.
+      - name: Open, update or close the tracking issue
+        if: ${{ !inputs.quick }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TITLE: ${{ env.ISSUE_TITLE }}
+          BODY: ${{ runner.temp }}/issue-body.md
+          PROMOTIONS: ${{ steps.delta.outputs.promotions }}
+          REGRESSIONS: ${{ steps.delta.outputs.regressions }}
+          FINGERPRINT: ${{ steps.delta.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          if [ "$PROMOTIONS" -eq 0 ] && [ "$REGRESSIONS" -eq 0 ]; then
+            .github/scripts/tracking-issue.sh --title "$TITLE" --empty \
+              --close-comment "Every test that passes is on the allowlist and every test on it passes. Closing; it will reopen as a new issue when that changes."
+            exit 0
+          fi
+          .github/scripts/tracking-issue.sh \
+            --title "$TITLE" \
+            --body "$BODY" \
+            --fingerprint "$FINGERPRINT" \
+            --change-comment "The delta changed. The description above has been rewritten to match last night's run."
+
+      # After the issue, deliberately: a regression is the one finding here that
+      # should stop the world, and it is also the one worth writing down before
+      # the job goes red.
+      #
+      # Not on a quick dispatch, for the same reason the issue is not filed
+      # there: a run of one module leaves every allowlisted test in the other
+      # eleven looking like a regression.
+      - name: Fail on a regression
+        if: ${{ !inputs.quick && steps.delta.outputs.regressions != '0' }}
+        env:
+          REGRESSIONS: ${{ steps.delta.outputs.regressions }}
+        run: |
+          echo "${REGRESSIONS} allowlisted test(s) did not pass the full-suite run." >&2
+          echo "The pull-request gate runs the same list, so either something merged without it or the two runs disagree about what a node ID resolves to. See the tracking issue." >&2
+          exit 1
+
+  # The crash harness at the iteration count the pull-request path cannot spend.
+  #
+  # Forty iterations on a pull request is a sample. Seventy-five is a larger
+  # sample, not a proof, and the doc comment on the harness is clear about what
+  # a green run does and does not say: on a real filesystem a SIGKILL falsifies
+  # the publication ordering, never the fsync discipline. The job that tests the
+  # latter is LazyFS, and it is not written yet.
+  #
+  # This one has no tracking issue, unlike the recon above. Its finding set is a
+  # boolean, the run goes red, and the seed and the post-crash store are
+  # attached below; whether that reaches anyone by mail depends on each
+  # account's notification settings rather than on anything this repository
+  # controls, so the artifact and the red run are what it rests on. An issue
+  # would add a place for the same fact to go stale in.
+  #
+  # What that costs is liveness: nothing here would say so if the schedule
+  # itself stopped firing. The recon's tracking issue is the answer, and it only
+  # works because both jobs are on one schedule. Splitting them into separate
+  # workflows would leave this one able to die quietly, which is the failure
+  # mode the standing tracking-issue rule exists to prevent.
+  crash-loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.98" }
+      - uses: Swatinem/rust-cache@v2
+
+      # Same disk-full arrangement as ci.yml: the loopback filesystem is mounted
+      # here because mounting needs root, and AKS3_ENOSPC_REQUIRED turns the
+      # leg's skip into a failure so that broken wiring cannot pass for a run.
+      - run: tests/enospc/setup-loopback.sh
+
+      # --nocapture because at this iteration count a run that hangs and is
+      # killed by timeout-minutes would otherwise print nothing at all, and the
+      # seed of the iteration it hung on is the whole of the evidence.
+      - run: cargo test -p aks3-server --test crash -- --nocapture
+        env:
+          AKS3_CRASH_ITERATIONS: ${{ inputs.quick && '10' || '75' }}
+          AKS3_ENOSPC_DIR: /mnt/aks3-enospc
+          AKS3_ENOSPC_REQUIRED: "1"
+
+      # Before the teardown, because the harness archives the post-crash store
+      # under the target directory and a disk-full failure would otherwise
+      # destroy its own evidence when the filesystem holding it is unmounted.
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: crash-artifacts-nightly
+          path: target/tmp/crash-artifacts/
+          if-no-files-found: ignore
+
+      - run: tests/enospc/setup-loopback.sh --teardown
+        if: always()

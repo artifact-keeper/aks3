@@ -1,0 +1,50 @@
+# Top-level Python dependencies of the compliance harness, compiled into the
+# hash-pinned requirements.txt beside it.
+#
+# The first block mirrors, exactly, the requirements.txt that ceph/s3-tests
+# carries at the revision pinned as S3_TESTS_REF in run-s3-tests.sh. Same
+# packages, same lower bounds: the point of this file is not to change the
+# dependency set the suite expects, only to stop the versions from moving on
+# their own. Bumping S3_TESTS_REF means re-reading that file and re-compiling
+# this one in the same commit.
+#
+# Recompile with (uv 0.9 or newer):
+#
+#   uv pip compile --generate-hashes --python-version 3.12 \
+#     --python-platform linux tests/compliance/requirements.in \
+#     -o tests/compliance/requirements.txt
+#
+# The resolution targets CPython 3.12 on Linux, which is what CI runs. A macOS
+# run installs from the same file: --generate-hashes records the hash of every
+# distribution file of a pinned version, wheels for other platforms included,
+# so pip picks the right wheel and still finds its hash.
+#
+# The 3.12 half of that is also in .python-version beside this file, which is
+# where Dependabot looks: it resolves with an interpreter of its own choosing,
+# and a bump resolved under a different one would quietly move the markers.
+PyYAML
+boto3 >=1.0.0
+botocore
+munch >=2.0.0
+# 0.14 switches to libev, that means bootstrap needs to change too
+gevent >=1.0
+isodate >=0.4.4
+requests >=2.23.0
+pytz
+httplib2
+lxml
+pytest
+tox
+
+# Not upstream's. The nightly recon runs the whole suite rather than the
+# allowlist, so one test that hangs against an unimplemented operation would
+# otherwise burn the job's hour on its own. Installed on the pull-request path
+# too, so the two runs share one environment and one lockfile.
+pytest-timeout
+
+# The suite installs itself with `pip install -e .`, which builds s3tests'
+# setup.py. Python 3.12's venv no longer ships setuptools, so without this the
+# build would fetch its own copy into an isolated environment, unpinned and
+# unhashed, which is the hole this file exists to close. Pinned here and
+# installed with --no-build-isolation instead.
+setuptools

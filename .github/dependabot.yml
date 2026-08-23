@@ -42,6 +42,27 @@ updates:
     commit-message:
       prefix: chore
 
+  # The compliance harness pins its Python dependencies in
+  # tests/compliance/requirements.txt, compiled with hashes from the
+  # requirements.in beside it. Dependabot recognises the pair as a pip-compile
+  # layout and regenerates the hashes when it moves a version, which is the
+  # only reason the lockfile is named requirements.txt rather than something
+  # more descriptive: pip is a file-name-driven ecosystem here.
+  #
+  # Grouped, because this set moves as one environment. What a bump has to
+  # survive is the compliance job on its own pull request, and that job runs
+  # the same allowlist gate everything else does.
+  - package-ecosystem: pip
+    directory: /tests/compliance
+    schedule:
+      interval: weekly
+    groups:
+      compliance-python:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: chore
+
   # Cargo.lock is committed and the build uses --locked, so a dependency only
   # moves when a pull request moves it. Minor and patch updates are batched;
   # majors arrive separately because they are the ones that break something.
