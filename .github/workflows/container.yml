@@ -68,7 +68,7 @@ jobs:
       # our source label reads as aks3 at a Red Hat commit.
       - name: Image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
           labels: |
@@ -270,7 +270,7 @@ jobs:
       # manifests, which already carry the build job's labels anyway.
       - name: Tags and annotations
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         env:
           DOCKER_METADATA_ANNOTATIONS_LEVELS: index
         with:
