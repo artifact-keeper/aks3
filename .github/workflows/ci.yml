@@ -83,7 +83,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with: { toolchain: "1.98" }
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       # Milliseconds, and it rides here rather than only in the nightly because
       # this is where a change to the delta arithmetic is made. The input that
