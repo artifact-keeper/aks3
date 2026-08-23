@@ -407,9 +407,11 @@ mod proptests {
     /// One step of a manifest's life.
     #[derive(Debug, Clone)]
     enum Op {
-        /// A `PUT`: the entry becomes the current version.
-        Upsert(String, String),
-        /// A `DELETE` naming a version.
+        /// A write: the entry becomes the current version. A `PUT` when the
+        /// flag is clear, the tombstone a `DELETE` leaves when it is set, since
+        /// both reach the manifest the same way.
+        Upsert(String, String, bool),
+        /// Dropping one named version from history.
         Remove(String),
     }
 
@@ -424,12 +426,13 @@ mod proptests {
 
     fn op() -> impl Strategy<Value = Op> {
         prop_oneof![
-            3 => (version_id(), "[0-9a-f]{4}").prop_map(|(id, etag)| Op::Upsert(id, etag)),
+            3 => (version_id(), "[0-9a-f]{4}", any::<bool>())
+                .prop_map(|(id, etag, marker)| Op::Upsert(id, etag, marker)),
             1 => version_id().prop_map(Op::Remove),
         ]
     }
 
-    fn entry(version_id: &str, etag: &str) -> VersionEntry {
+    fn entry(version_id: &str, etag: &str, delete_marker: bool) -> VersionEntry {
         VersionEntry {
             version_id: version_id.to_owned(),
             etag: etag.to_owned(),
@@ -437,7 +440,7 @@ mod proptests {
             content_type: "application/octet-stream".to_owned(),
             user_metadata: BTreeMap::new(),
             mtime_epoch_ms: 0,
-            delete_marker: false,
+            delete_marker,
         }
     }
 
@@ -482,22 +485,32 @@ mod proptests {
             ops in prop::collection::vec(op(), 0..24),
         ) {
             let mut m = VersionManifest { format: MANIFEST_FORMAT, versions: vec![] };
-            // The model is just the ids, newest first, which is all the
-            // ordering a manifest promises.
-            let mut model: Vec<String> = Vec::new();
+            // The model records when each surviving id was last written, and
+            // nothing about how `upsert` arranges the vector. "Newest first" is
+            // the whole ordering claim the manifest makes, so a model built
+            // from write order tests that claim; a model built by retaining and
+            // inserting would only be a copy of the implementation, and would
+            // agree with it however wrong both were.
+            let mut written: BTreeMap<String, u64> = BTreeMap::new();
+            let mut clock: u64 = 0;
 
             for step in ops {
                 let before = m.versions.len();
                 match step {
-                    Op::Upsert(id, etag) => {
-                        let known = model.contains(&id);
-                        m.upsert(entry(&id, &etag));
-                        model.retain(|v| v != &id);
-                        model.insert(0, id.clone());
+                    Op::Upsert(id, etag, marker) => {
+                        let known = written.contains_key(&id);
+                        m.upsert(entry(&id, &etag, marker));
+                        clock += 1;
+                        written.insert(id.clone(), clock);
 
+                        // The whole entry, not just its id: a head carrying the
+                        // right id and a previous write's bytes is the version
+                        // loss this property exists to catch.
                         let head = m.latest().expect("a manifest with an entry has a head");
-                        prop_assert_eq!(&head.version_id, &id, "the upserted entry is not the head");
-                        prop_assert_eq!(&head.etag, &etag, "the head is a stale copy of {:?}", id);
+                        prop_assert_eq!(
+                            head, &entry(&id, &etag, marker),
+                            "the head is not the entry just written"
+                        );
                         if known {
                             prop_assert_eq!(m.versions.len(), before, "an overwrite grew history");
                         } else {
@@ -505,12 +518,12 @@ mod proptests {
                         }
                     }
                     Op::Remove(id) => {
-                        let known = model.contains(&id);
+                        let known = written.contains_key(&id);
                         if let Some(removed) = m.remove(&id) {
                             prop_assert!(known, "removed {:?}, which was not there", id);
                             prop_assert_eq!(removed.version_id, id.clone());
                             prop_assert_eq!(m.versions.len(), before - 1);
-                            model.retain(|v| v != &id);
+                            written.remove(&id);
                         } else {
                             prop_assert!(!known, "did not remove {:?}, which was there", id);
                             prop_assert_eq!(
@@ -525,7 +538,12 @@ mod proptests {
                 let ids: Vec<&str> = m.versions.iter().map(|e| e.version_id.as_str()).collect();
                 let unique: BTreeSet<&str> = ids.iter().copied().collect();
                 prop_assert_eq!(unique.len(), ids.len(), "duplicate version ids in {:?}", ids);
-                let want: Vec<&str> = model.iter().map(String::as_str).collect();
+
+                // Exactly the ids written and not since removed, most recently
+                // written first. Write numbers are distinct, so the order is
+                // total and the comparison is exact.
+                let mut want: Vec<&str> = written.keys().map(String::as_str).collect();
+                want.sort_by_key(|id| std::cmp::Reverse(written[*id]));
                 prop_assert_eq!(&ids, &want);
             }
         }
@@ -533,12 +551,20 @@ mod proptests {
         /// A manifest reaches disk as JSON, so anything it can hold has to
         /// survive that trip unchanged: a field that serialized lossily would
         /// lose object metadata on the next read.
+        ///
+        /// Byte stability is the second half, and the one the crash-safety
+        /// story leans on. Reading a manifest and writing it back has to
+        /// produce the same file, or a no-op rewrite would republish different
+        /// bytes and every claim about what a reader can observe mid-write
+        /// would be about a different file each time.
         #[test]
         fn a_manifest_survives_the_json_it_is_stored_as(m in arbitrary_manifest()) {
             let json = serde_json::to_vec(&m).expect("a manifest serializes");
             let back: VersionManifest =
                 serde_json::from_slice(&json).expect("a manifest we wrote parses");
-            prop_assert_eq!(back, m);
+            prop_assert_eq!(&back, &m);
+            let again = serde_json::to_vec(&back).expect("a manifest we read serializes");
+            prop_assert_eq!(again, json, "rewriting a manifest changed its bytes");
         }
     }
 }

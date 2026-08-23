@@ -631,6 +631,45 @@ mod proptests {
         ]
     }
 
+    /// Recover the version id [`data_file_name`] was called with, or `None` if
+    /// `name` is not something it could have produced.
+    ///
+    /// A left inverse, written out here rather than in the module because
+    /// nothing in aks3 needs to read a version id back off a file name; the
+    /// walk works from manifests. It exists so that injectivity can be asserted
+    /// over the whole id space instead of by drawing pairs.
+    ///
+    /// Its hex parsing is deliberately stricter than the module's own
+    /// [`hex_val`], which accepts either case. [`data_file_name`] emits
+    /// uppercase, and reusing the lenient parser would let a drift to lowercase
+    /// hex roundtrip cleanly and go unnoticed.
+    fn decode_data_file_name(name: &str) -> Option<String> {
+        fn upper_hex(b: u8) -> Option<u8> {
+            match b {
+                b'0'..=b'9' => Some(b - b'0'),
+                b'A'..=b'F' => Some(b - b'A' + 10),
+                _ => None,
+            }
+        }
+
+        let body = name.strip_prefix("__aks3.v.")?.strip_suffix(".data")?;
+        let bytes = body.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                let hi = upper_hex(*bytes.get(i + 1)?)?;
+                let lo = upper_hex(*bytes.get(i + 2)?)?;
+                out.push((hi << 4) | lo);
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).ok()
+    }
+
     /// Version ids that satisfy [`is_valid_version_id`], including the shapes
     /// aks3 actually mints.
     fn well_formed_version_id() -> impl Strategy<Value = String> {
@@ -662,10 +701,13 @@ mod proptests {
             prop_assert_eq!(rel_path_to_key(&p), Ok(k));
         }
 
-        /// Distinct keys never share a path. Injectivity is what stops one
-        /// object from landing on another's bytes, and roundtrip fidelity alone
-        /// does not say it: a rule that collapsed two keys onto one name could
-        /// still decode that name back to one of them.
+        /// Distinct keys never share a path, which is what stops one object
+        /// from landing on another's bytes.
+        ///
+        /// A corollary of the roundtrip above, asserted directly: the roundtrip
+        /// exhibits a left inverse of the encoding, and a function with a left
+        /// inverse is injective. Stating it separately costs nothing and names
+        /// the consequence that actually matters.
         #[test]
         fn distinct_keys_get_distinct_paths(a in key(), b in key()) {
             prop_assume!(a != b);
@@ -709,8 +751,24 @@ mod proptests {
             prop_assert!(matches!(comps[0], Component::Normal(_)), "{id:?} produced {comps:?}");
         }
 
-        /// Two version ids never name one data file, so a version can never
-        /// overwrite the bytes of another.
+        /// A data file name says which version id it was built from, and only
+        /// that one. This is what makes the naming injective, so no version can
+        /// ever overwrite the bytes of another.
+        ///
+        /// Stated as a left inverse rather than by comparing pairs, because
+        /// pairs cannot say it: two independently drawn ids collide about once
+        /// in a million draws, so a pairwise property would pass at any case
+        /// count CI can afford without ever having tested the claim.
+        /// [`decode_data_file_name`] recovers the id from the name over the
+        /// whole space, which is the same claim and is checkable.
+        #[test]
+        fn a_data_file_name_names_exactly_its_version_id(id in version_id()) {
+            prop_assert_eq!(decode_data_file_name(&data_file_name(&id)), Some(id));
+        }
+
+        /// The pairwise reading of the same claim. Kept because it is the form
+        /// the module documents, not because it carries the evidence: see
+        /// above for why it cannot.
         #[test]
         fn data_file_names_are_injective(a in version_id(), b in version_id()) {
             prop_assume!(a != b);
