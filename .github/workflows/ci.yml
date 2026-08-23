@@ -25,8 +25,19 @@ jobs:
       # case prints a `cc <seed>` line to paste into the matching file under
       # crates/engine/proptest-regressions/, so a CI-only failure is
       # reproducible locally without rerunning at this count.
+      # The crash harness's disk-full leg fills a filesystem completely, which
+      # it may only do to one mounted for it. Mounting needs root, so it happens
+      # here rather than inside the test: with AKS3_ENOSPC_DIR unset the leg
+      # prints why it is skipping and passes, which is what keeps
+      # `cargo test --workspace` runnable without sudo everywhere else.
+      - run: tests/enospc/setup-loopback.sh
       - run: cargo test --workspace
-        env: { PROPTEST_CASES: "1024" }
+        env: { PROPTEST_CASES: "1024", AKS3_ENOSPC_DIR: /mnt/aks3-enospc }
+      # Even when the tests failed: a loop device and a mount left behind
+      # outlive the job on a self-hosted runner, and cost nothing to release on
+      # a hosted one.
+      - run: tests/enospc/setup-loopback.sh --teardown
+        if: always()
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   # Runs the allowlisted subset of ceph/s3-tests against a real aks3 process.
