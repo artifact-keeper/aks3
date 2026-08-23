@@ -1509,24 +1509,24 @@ async fn put_until_refused(
     ))
 }
 
-/// A full disk reaches the caller as [`EngineError::Io`] carrying `ENOSPC`.
+/// A full disk reaches the caller as [`EngineError::StorageFull`].
 ///
-/// Pinned, not endorsed. The engine has no disk-full variant, so the condition
-/// arrives in the catch-all one and the API layer turns that into a bare 500
-/// (see [`check_refusal`]). The taxonomy that would let a client tell "this
-/// server is out of space, back off" from "this server has a bug" is issue #29,
-/// and this assertion is what makes changing the class a deliberate edit here
-/// rather than a silent one there.
+/// The engine classifies `ENOSPC` (`ErrorKind::StorageFull`) into its own
+/// disk-full variant rather than the catch-all [`EngineError::Io`], so a caller
+/// can tell "this server is out of space, back off" from "this server has a bug".
+/// The API layer maps it to a retryable 503 (see [`check_refusal`]). This was
+/// issue #29; the assertion keeps the class pinned so a future change to it is a
+/// deliberate edit here.
 fn check_enospc_class(what: &str, err: &EngineError) -> Result<(), String> {
     match err {
-        EngineError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull => Ok(()),
+        EngineError::StorageFull => Ok(()),
         EngineError::Io(io) => Err(format!(
-            "{what} failed with an i/o error that is not ENOSPC: {io} (kind {:?}, raw {:?})",
+            "{what} failed with an i/o error rather than StorageFull: {io} (kind {:?}, raw {:?})",
             io.kind(),
             io.raw_os_error()
         )),
         other => Err(format!(
-            "{what} failed with {other:?}, not an EngineError::Io carrying ENOSPC"
+            "{what} failed with {other:?}, not EngineError::StorageFull"
         )),
     }
 }
@@ -1752,18 +1752,17 @@ async fn http_put_until_refused(
     ))
 }
 
-/// A full disk reaches the client as a 500 `InternalError`.
+/// A full disk reaches the client as a 503 `ServiceUnavailable`.
 ///
-/// Pinned, not endorsed, and the reason is one layer down: the engine reports
-/// `ENOSPC` in its catch-all [`EngineError::Io`] variant, and `map_engine_err`
-/// turns that into a bare `InternalError` so no host path can leak in the
-/// response. A client cannot tell a server that is out of space from one that is
-/// broken, and AWS itself would answer this class of condition with a
-/// retry-after-style 503 or a 507-ish "insufficient storage" rather than a 500.
-/// Fixing that means a disk-full variant in the engine's error taxonomy, which
-/// is issue #29 rather than something this test changes; what the test does is
-/// make the current answer a written-down one, so that issue edits this line
-/// deliberately.
+/// The engine classifies `ENOSPC` into [`EngineError::StorageFull`] and
+/// `map_engine_err` turns that into a retryable 503, so a client, a load
+/// balancer, or a retry policy can tell a server that is out of space from one
+/// that is broken: a 503 reads as a capacity signal to back off on, where the
+/// old bare 500 `InternalError` read as a defect. `ServiceUnavailable` is the
+/// closest code s3s 0.14 carries; it has no `InsufficientStorage`/507. This was
+/// issue #29, and the assertion pins the new class so a future change is
+/// deliberate. The message never carries a host path, which is why the disk-full
+/// condition gets its own variant rather than riding in [`EngineError::Io`].
 ///
 /// One outcome is deliberately not allowed here: a dropped connection. Both body
 /// sizes this leg uses are small enough that the client finishes sending before
@@ -1773,9 +1772,9 @@ async fn http_put_until_refused(
 /// difference between "a full disk answers" and "a full disk hangs up", which is
 /// the difference a client's error handling is built on.
 fn check_refusal(what: &str, refusal: &Refusal) -> Result<(), String> {
-    if refusal.status != Some(500) || refusal.code.as_deref() != Some("InternalError") {
+    if refusal.status != Some(503) || refusal.code.as_deref() != Some("ServiceUnavailable") {
         return Err(format!(
-            "{what} came back as status {:?} code {:?}, not the 500 InternalError this \
+            "{what} came back as status {:?} code {:?}, not the 503 ServiceUnavailable this \
              pins: {}",
             refusal.status, refusal.code, refusal.detail
         ));
@@ -1876,10 +1875,10 @@ async fn http_disk_full(store: &Path, ballast: &Path, seed: u64) -> Result<(), S
         ));
     }
 
-    // A 500 on the way in does not leave a key half there: the client that got
+    // A 503 on the way in does not leave a key half there: the client that got
     // one has to be able to conclude the object does not exist.
     for refusal in [&big, &small] {
-        http_head_missing(&c, "the PUT came back 500", refusal.index).await?;
+        http_head_missing(&c, "the PUT came back 503", refusal.index).await?;
     }
 
     // Still a server, not just a process that is up: a read of something written

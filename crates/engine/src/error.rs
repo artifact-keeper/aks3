@@ -18,9 +18,11 @@
 //!
 //! # Classifying an I/O error
 //!
-//! One filesystem failure is the client's fault rather than ours, and it is
-//! sorted out here rather than at each call site: a name the filesystem refuses
-//! as too long. See [`EngineError::KeyTooLong`] and the [`From`] impl below.
+//! Two filesystem failures are sorted out here rather than at each call site: a
+//! name the filesystem refuses as too long, which is the client's fault, and the
+//! disk running out from under a write, which is the deployment's. See
+//! [`EngineError::KeyTooLong`], [`EngineError::StorageFull`], and the [`From`]
+//! impl below.
 
 /// A storage engine failure.
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +64,22 @@ pub enum EngineError {
     /// property is at fault.
     #[error("key too long for the filesystem")]
     KeyTooLong,
+    /// The filesystem is out of space (`ENOSPC`): a write could not be committed
+    /// because the disk backing the store is full.
+    ///
+    /// This is about the deployment rather than the request. The same key and the
+    /// same bytes would store fine on a disk with room, so it is not the client's
+    /// fault, but it is also not a bug the way a bare I/O failure is: a client, a
+    /// load balancer, or a retry policy should be able to tell "this server is out
+    /// of space, back off and let an operator grow the disk" apart from "this
+    /// server hit something it did not expect". The API layer maps it to a
+    /// retryable 5xx rather than to `InternalError`; see `map_engine_err`.
+    ///
+    /// Carried as its own variant, and not folded into [`EngineError::Io`], so the
+    /// message it is built from never reaches a client: like every other variant
+    /// here it holds nothing, so there is no host path to leak.
+    #[error("storage full")]
+    StorageFull,
     /// Anything the filesystem reported. Not a client-visible condition.
     #[error("io: {0}")]
     Io(std::io::Error),
@@ -88,12 +106,19 @@ pub enum EngineError {
 /// answer is the right one. A `data_dir` so deeply nested that ordinary keys
 /// overflow `PATH_MAX` would be misreported as the client's fault, which is
 /// the one case this classification gets wrong.
+/// [`std::io::ErrorKind::StorageFull`] is what the standard library decodes
+/// `ENOSPC` to (raw OS error 28 on both macOS and Linux). It is a stable
+/// `ErrorKind`, so the classification names the kind rather than the raw errno,
+/// the same way the too-long case names `InvalidFilename`. A full disk is a
+/// property of the deployment, not the request, so it becomes
+/// [`EngineError::StorageFull`] rather than being buried in the catch-all where a
+/// client could not tell it from a bug.
 impl From<std::io::Error> for EngineError {
     fn from(err: std::io::Error) -> Self {
-        if err.kind() == std::io::ErrorKind::InvalidFilename {
-            Self::KeyTooLong
-        } else {
-            Self::Io(err)
+        match err.kind() {
+            std::io::ErrorKind::InvalidFilename => Self::KeyTooLong,
+            std::io::ErrorKind::StorageFull => Self::StorageFull,
+            _ => Self::Io(err),
         }
     }
 }
@@ -115,6 +140,16 @@ mod tests {
             matches!(EngineError::from(err), EngineError::KeyTooLong),
             "ENAMETOOLONG did not decode to ErrorKind::InvalidFilename on this platform"
         );
+    }
+
+    /// A full disk (`ENOSPC`, which the standard library decodes to
+    /// `ErrorKind::StorageFull`) is classified as its own condition rather than
+    /// swept into the catch-all, so the API layer can answer it with a retryable
+    /// 5xx instead of a bare 500.
+    #[test]
+    fn a_full_disk_is_storage_full_not_an_io_error() {
+        let err = EngineError::from(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        assert!(matches!(err, EngineError::StorageFull));
     }
 
     /// Everything else stays an I/O error, so the classification cannot swallow

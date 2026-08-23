@@ -29,6 +29,10 @@ def test_get_of_a_missing_key(s3, bucket):
     response = err.value.response
     assert response["Error"]["Code"] == "NoSuchKey"
     assert response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    # The human half of the error, not just the code a branch reads. boto3
+    # renders a missing Message as the literal "Unknown"; a real one is what
+    # lands in a traceback or a support ticket.
+    assert response["Error"]["Message"] == "The specified key does not exist"
 
 
 def test_head_of_a_missing_key(s3, bucket):
@@ -67,6 +71,7 @@ def test_operations_on_a_missing_bucket(s3, call):
 
     assert err.value.response["Error"]["Code"] == "NoSuchBucket"
     assert err.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+    assert err.value.response["Error"]["Message"] == "The specified bucket does not exist"
 
 
 def test_deleting_a_non_empty_bucket(s3, bucket):
@@ -77,6 +82,7 @@ def test_deleting_a_non_empty_bucket(s3, bucket):
 
     assert err.value.response["Error"]["Code"] == "BucketNotEmpty"
     assert err.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+    assert err.value.response["Error"]["Message"] == "The bucket you tried to delete is not empty"
 
     # And the bucket survived the attempt, contents intact.
     assert s3.get_object(Bucket=bucket, Key="occupant")["Body"].read() == b"x"
@@ -104,6 +110,7 @@ def test_an_illegal_bucket_name(s3):
 
     assert err.value.response["Error"]["Code"] == "InvalidBucketName"
     assert err.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert err.value.response["Error"]["Message"] == "The specified bucket is not valid"
 
 
 def test_bad_credentials(client_factory, bucket):
