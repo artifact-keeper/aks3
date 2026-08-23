@@ -51,7 +51,10 @@ updates:
   #
   # Grouped, because this set moves as one environment. What a bump has to
   # survive is the compliance job on its own pull request, and that job runs
-  # the same allowlist gate everything else does.
+  # the same allowlist gate everything else does plus the boto3 golden paths in
+  # tests/compliance/boto3-tests. The boto3 pin is the one that matters most
+  # here: that suite exists to catch the SDK changing what it puts on the wire,
+  # so a bump landing on it is the entire point rather than a side effect.
   - package-ecosystem: pip
     directory: /tests/compliance
     schedule:
