@@ -43,6 +43,7 @@ use s3s::dto::{
     MaxKeys, Object, Owner, PutObjectInput, PutObjectOutput, Range as DtoRange, StreamingBlob,
     Timestamp,
 };
+use s3s::header::{CONTENT_ENCODING, X_AMZ_CONTENT_SHA256, X_AMZ_DECODED_CONTENT_LENGTH};
 use s3s::{s3_error, S3Request, S3Response, S3Result};
 
 use crate::error::map_engine_err;
@@ -164,6 +165,93 @@ impl Stream for SyncStream {
     }
 }
 
+/// The `x-amz-content-sha256` values that put a request body in aws-chunked
+/// framing.
+///
+/// `s3s` decides whether a body is chunked from this header alone: it builds an
+/// `AwsChunkedStream` and decodes the framing only when the value is one of
+/// these, and passes the body through untouched for anything else.
+///
+/// This list must mirror `s3s`'s `AmzContentSha256::is_streaming()` (all five
+/// variants it returns `true` for): the two ECDSA (`SigV4A`) sentinels are
+/// inert today because `s3s` 0.14 answers them `NotImplemented` before a
+/// handler runs, but listing them means that if a later `s3s` starts decoding
+/// them this guard keeps passing those legitimate uploads rather than turning
+/// them into false-positive `400`s.
+const STREAMING_SENTINELS: [&str; 5] = [
+    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+    "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+    "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD",
+    "STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER",
+];
+
+/// Whether a `Content-Encoding` names `aws-chunked` among its tokens.
+///
+/// The header is a comma-separated list, so `gzip, aws-chunked` announces the
+/// framing as much as `aws-chunked` on its own does. The comparison ignores
+/// case and surrounding space because header tokens carry neither meaning.
+fn declares_aws_chunked(value: &str) -> bool {
+    value
+        .split(',')
+        .any(|token| token.trim().eq_ignore_ascii_case("aws-chunked"))
+}
+
+/// Refuse a `PUT` that announces aws-chunked framing without a sentinel that
+/// tells `s3s` to decode it.
+///
+/// The framing of an aws-chunked body is a contract three headers carry:
+/// `Content-Encoding: aws-chunked` and `x-amz-decoded-content-length` announce
+/// it, and `x-amz-content-sha256` says how it was signed. `s3s` reads only the
+/// last, decoding the body when it is a streaming sentinel and treating it as
+/// opaque otherwise. When a request announces the encoding but signs a
+/// non-streaming sentinel (for instance `UNSIGNED-PAYLOAD`) the two disagree,
+/// and `s3s` hands the raw chunk envelope (`3f\r\n...0\r\n\r\n`) to the engine
+/// as the object's bytes: the object is stored longer than the body, under an
+/// etag over the framing, and the request is answered `200`. The corruption
+/// surfaces only when the object is read back.
+///
+/// Rejecting the request is the safe answer. Decoding it instead would mean
+/// guessing which of the two disagreeing halves the client meant, where
+/// refusing needs no guess.
+fn reject_contradictory_aws_chunked(headers: &http::HeaderMap) -> S3Result<()> {
+    let announces_chunked = headers
+        .get(CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(declares_aws_chunked);
+    let has_decoded_length = headers.contains_key(X_AMZ_DECODED_CONTENT_LENGTH);
+
+    // Nothing announced the framing, so there is no disagreement to catch and
+    // the ordinary paths (a plain body, a signed single-chunk hash) fall
+    // straight through.
+    if !announces_chunked && !has_decoded_length {
+        return Ok(());
+    }
+
+    let is_streaming = headers
+        .get(X_AMZ_CONTENT_SHA256)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|sentinel| {
+            STREAMING_SENTINELS
+                .iter()
+                .any(|streaming| sentinel.eq_ignore_ascii_case(streaming))
+        });
+
+    // The legitimate chunked paths land here: the encoding is announced and the
+    // sentinel agrees, so `s3s` will decode the framing and the body reaches the
+    // engine as the object it is.
+    if is_streaming {
+        return Ok(());
+    }
+
+    Err(s3_error!(
+        InvalidRequest,
+        "Content-Encoding: aws-chunked or x-amz-decoded-content-length declares \
+         aws-chunked framing, but x-amz-content-sha256 is not a streaming payload \
+         sentinel, so the framing would be stored as the object's bytes"
+    ))
+}
+
 #[async_trait::async_trait]
 impl<L: ObjectLayer> s3s::S3 for Aks3<L> {
     async fn create_bucket(
@@ -244,6 +332,11 @@ impl<L: ObjectLayer> s3s::S3 for Aks3<L> {
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
+        // Caught before the body is touched: a request that declares aws-chunked
+        // framing without a sentinel `s3s` decodes would otherwise store the
+        // chunk envelope as the object's bytes under a 200.
+        reject_contradictory_aws_chunked(&req.headers)?;
+
         let input = req.input;
         // `s3s` makes the body optional because a malformed request can arrive
         // without one. An empty object is a body of zero bytes, not this.
@@ -443,13 +536,18 @@ impl<L: ObjectLayer> s3s::S3 for Aks3<L> {
 
 #[cfg(test)]
 mod tests {
-    use super::{epoch_ms_to_systemtime, page_size, Aks3};
+    use super::{
+        declares_aws_chunked, epoch_ms_to_systemtime, page_size, reject_contradictory_aws_chunked,
+        Aks3, STREAMING_SENTINELS,
+    };
     use aks3_engine::FsEngine;
+    use http::header::{HeaderName, HeaderValue};
     use s3s::dto::{
         CreateBucketInput, DeleteBucketInput, DeleteObjectInput, ETag, GetObjectInput,
         HeadBucketInput, HeadObjectInput, ListBucketsInput, ListObjectsV2Input,
         ListObjectsV2Output, Metadata, PutObjectInput, Range, StreamingBlob, Timestamp,
     };
+    use s3s::header::{CONTENT_ENCODING, X_AMZ_CONTENT_SHA256, X_AMZ_DECODED_CONTENT_LENGTH};
     use s3s::{S3ErrorCode, S3Request, S3};
     use std::sync::Arc;
 
@@ -515,6 +613,29 @@ mod tests {
             body: Some(blob(bytes)),
             ..Default::default()
         })
+    }
+
+    /// A header map built from name/value pairs, for the aws-chunked checks.
+    fn header_map(pairs: &[(HeaderName, &str)]) -> http::HeaderMap {
+        let mut map = http::HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                name.clone(),
+                HeaderValue::from_str(value).expect("header value"),
+            );
+        }
+        map
+    }
+
+    /// `PUT buk/<key>` carrying `bytes`, with the given request headers set.
+    fn put_with_headers(
+        key: &str,
+        bytes: &'static [u8],
+        pairs: &[(HeaderName, &str)],
+    ) -> S3Request<PutObjectInput> {
+        let mut request = put(key, bytes);
+        request.headers = header_map(pairs);
+        request
     }
 
     fn get(key: &str) -> S3Request<GetObjectInput> {
@@ -948,6 +1069,140 @@ mod tests {
             .await
             .expect_err("no body");
         assert_eq!(*err.code(), S3ErrorCode::IncompleteBody);
+    }
+
+    /// `aws-chunked` is a token in a list, so it is recognised on its own, next
+    /// to other encodings, and whatever the case; an unrelated encoding is not.
+    #[test]
+    fn aws_chunked_is_recognised_as_a_content_encoding_token() {
+        assert!(declares_aws_chunked("aws-chunked"));
+        assert!(declares_aws_chunked("gzip, aws-chunked"));
+        assert!(declares_aws_chunked("AWS-Chunked"));
+        assert!(declares_aws_chunked("  aws-chunked  "));
+        assert!(!declares_aws_chunked("gzip"));
+        assert!(!declares_aws_chunked(""));
+    }
+
+    /// The guard leaves alone every request that does not announce the framing:
+    /// no headers at all, and a signed single-chunk hash on a plain body.
+    #[test]
+    fn a_request_that_does_not_announce_chunking_is_left_alone() {
+        reject_contradictory_aws_chunked(&header_map(&[])).expect("no chunk headers");
+        reject_contradictory_aws_chunked(&header_map(&[(
+            X_AMZ_CONTENT_SHA256,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )]))
+        .expect("a plain signed body");
+    }
+
+    /// Each streaming sentinel, with the encoding announced, is a legitimate
+    /// chunked upload and must pass. This covers the HMAC and unsigned-trailer
+    /// sentinels a current boto3 sends, and the two ECDSA (`SigV4A`) sentinels
+    /// that are inert under s3s 0.14 but must not become false positives if a
+    /// later s3s decodes them: the guard's allowlist mirrors s3s's
+    /// `is_streaming()`, and this asserts the ECDSA pair is in it.
+    #[test]
+    fn the_streaming_sentinels_are_accepted() {
+        assert!(STREAMING_SENTINELS.contains(&"STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD"));
+        assert!(STREAMING_SENTINELS.contains(&"STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER"));
+
+        for sentinel in STREAMING_SENTINELS {
+            reject_contradictory_aws_chunked(&header_map(&[
+                (CONTENT_ENCODING, "aws-chunked"),
+                (X_AMZ_DECODED_CONTENT_LENGTH, "63"),
+                (X_AMZ_CONTENT_SHA256, sentinel),
+            ]))
+            .unwrap_or_else(|_| panic!("{sentinel} is a legitimate chunked upload"));
+        }
+    }
+
+    /// The bug this fixes: `Content-Encoding: aws-chunked` signed with a
+    /// non-streaming sentinel is refused rather than stored as its own framing.
+    #[test]
+    fn aws_chunked_with_a_non_streaming_sentinel_is_rejected() {
+        let err = reject_contradictory_aws_chunked(&header_map(&[
+            (CONTENT_ENCODING, "aws-chunked"),
+            (X_AMZ_DECODED_CONTENT_LENGTH, "63"),
+            (X_AMZ_CONTENT_SHA256, "UNSIGNED-PAYLOAD"),
+        ]))
+        .expect_err("contradictory request");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidRequest);
+    }
+
+    /// Either announcing header alone is enough to be held to the sentinel:
+    /// `x-amz-decoded-content-length` with a non-streaming hash is refused, and
+    /// so is the decoded length with no `x-amz-content-sha256` at all.
+    #[test]
+    fn either_announcing_header_alone_is_held_to_the_sentinel() {
+        let err = reject_contradictory_aws_chunked(&header_map(&[
+            (X_AMZ_DECODED_CONTENT_LENGTH, "63"),
+            (X_AMZ_CONTENT_SHA256, "UNSIGNED-PAYLOAD"),
+        ]))
+        .expect_err("decoded length without a streaming sentinel");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidRequest);
+
+        let err =
+            reject_contradictory_aws_chunked(&header_map(&[(X_AMZ_DECODED_CONTENT_LENGTH, "63")]))
+                .expect_err("decoded length with no sentinel");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidRequest);
+    }
+
+    /// End to end through the trait: a contradictory chunked `PUT` is a 400 and
+    /// stores nothing, so the chunk framing never becomes an object.
+    #[tokio::test]
+    async fn a_contradictory_chunked_put_is_rejected_and_stores_nothing() {
+        let (_dir, s) = svc().await;
+        s.create_bucket(create("buk")).await.expect("create");
+
+        // The issue's request: 63 bytes of body wrapped in chunk framing,
+        // declared aws-chunked but signed UNSIGNED-PAYLOAD.
+        let framed =
+            b"3f\r\nintegrity checksums are computed by default since botocore 1.36\r\n0\r\n\r\n";
+        let err = s
+            .put_object(put_with_headers(
+                "framed",
+                framed,
+                &[
+                    (CONTENT_ENCODING, "aws-chunked"),
+                    (X_AMZ_DECODED_CONTENT_LENGTH, "63"),
+                    (X_AMZ_CONTENT_SHA256, "UNSIGNED-PAYLOAD"),
+                ],
+            ))
+            .await
+            .expect_err("contradictory request");
+        assert_eq!(*err.code(), S3ErrorCode::InvalidRequest);
+
+        let err = s
+            .head_object(head_object_req("framed"))
+            .await
+            .expect_err("nothing stored");
+        assert_eq!(*err.code(), S3ErrorCode::NoSuchKey);
+    }
+
+    /// The legitimate trailer path is not caught by the guard: the encoding is
+    /// announced and the sentinel agrees, so the `PUT` goes through.
+    #[tokio::test]
+    async fn a_legitimate_chunked_put_is_not_rejected() {
+        let (_dir, s) = svc().await;
+        s.create_bucket(create("buk")).await.expect("create");
+
+        s.put_object(put_with_headers(
+            "trailered",
+            b"hello world",
+            &[
+                (CONTENT_ENCODING, "aws-chunked"),
+                (X_AMZ_DECODED_CONTENT_LENGTH, "11"),
+                (X_AMZ_CONTENT_SHA256, "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+            ],
+        ))
+        .await
+        .expect("legitimate chunked put");
+
+        let head = s
+            .head_object(head_object_req("trailered"))
+            .await
+            .expect("head");
+        assert_eq!(head.output.content_length, Some(11));
     }
 
     /// What a `PUT` declares comes back on both a `HEAD` and a `GET`: the
