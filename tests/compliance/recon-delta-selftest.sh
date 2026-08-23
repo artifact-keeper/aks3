@@ -29,6 +29,51 @@ failures=0
 mkdir -p "$WORK/suite/s3tests/functional"
 touch "$WORK/suite/s3tests/functional/test_s3.py"
 
+# Real source for the vacuous-candidate filter to read. The filter inspects the
+# function body of each promotion candidate under --suite-root, so these cases
+# need actual Python to parse, not the touched-empty file the node-ID cases use.
+cat > "$WORK/suite/s3tests/functional/test_s3select.py" <<'PYSRC'
+def test_version():
+    return
+    client = get_client()
+    client.list_buckets()
+
+
+def test_output_serial_expressions():
+    return  # TODO fix test
+    run_s3select("select * from s3object")
+
+
+def test_documented_stub():
+    """A docstring, then a leading return: still a stub."""
+    return
+
+
+def test_real_select():
+    client = get_client()
+    resp = client.select_object_content(Bucket="b", Key="k")
+    assert resp is not None
+
+
+def test_delegates_via_return():
+    # First statement is `return <expr>`: the return expression IS the test, so
+    # this is a genuine test, not a stub, and must never be dropped.
+    return get_client().select_object_content(Bucket="b", Key="k")
+
+
+def test_docstring_then_assert():
+    """A docstring, then real work: a genuine test."""
+    resp = get_client().list_buckets()
+    assert resp is not None
+PYSRC
+
+cat > "$WORK/suite/s3tests/functional/test_utils.py" <<'PYSRC'
+def test_generate():
+    # Asserts only on the suite's own helper; never contacts the server.
+    got = generate_random(100)
+    assert len(got) == 100
+PYSRC
+
 # Writes a JUnit report. Every argument is `status:classname:name[:file]`,
 # where status is pass, failure, error or skipped. Repeating a classname and
 # name emits a second element for the same test, which is how pytest reports a
@@ -109,6 +154,82 @@ write_allowlist "$WORK/one.txt" "$FILE::test_a"
 check "promotion candidate" "$WORK/empty.xml" "$WORK/one.txt" \
   passing=2 promotions=1 regressions=0
 
+# The vacuous-candidate filter. A test can pass without ever reaching the
+# server: its body may be a leading `return` (a stub disabled upstream), or it
+# may only assert on the suite's own helpers. Both read as green and would
+# surface as promotion candidates, which for an unimplemented feature is
+# misleading. The filter reads each candidate's source under --suite-root and
+# drops those two shapes from the candidate surface, without touching the pass
+# count, the allowlist gate or the regression set.
+SEL=s3tests.functional.test_s3select
+SELF=s3tests/functional/test_s3select.py
+UTL=s3tests.functional.test_utils
+UTLF=s3tests/functional/test_utils.py
+write_allowlist "$WORK/nolist.txt" "# nothing on the allowlist"
+
+# A stub whose body begins with `return` is filtered out: it passes, is not on
+# the allowlist, but nothing after the return ever runs.
+write_report "$WORK/stub.xml" "pass:$SEL:test_version:$SELF"
+check "stub return is filtered from candidates" "$WORK/stub.xml" "$WORK/nolist.txt" \
+  passing=1 promotions=0 suppressed=1 regressions=0
+
+# A test_utils-style test that only exercises the suite's own random-data helper
+# is filtered out by the no-client-calls module rule.
+write_report "$WORK/utils.xml" "pass:$UTL:test_generate:$UTLF"
+check "test_utils no-client test is filtered from candidates" "$WORK/utils.xml" "$WORK/nolist.txt" \
+  passing=1 promotions=0 suppressed=1 regressions=0
+
+# A genuine test that issues a client call still surfaces as a candidate, so the
+# filter does not swallow real work (this stands in for the two #35 promotions).
+write_report "$WORK/real.xml" "pass:$SEL:test_real_select:$SELF"
+check "genuine test still surfaces" "$WORK/real.xml" "$WORK/nolist.txt" \
+  passing=1 promotions=1 suppressed=0 regressions=0
+
+# The #35 shape in one report: four vacuous passes (a bare return, a return with
+# a trailing comment, a return past a docstring, and a helper-only test) beside
+# one genuine test. Only the genuine one should reach the candidate list.
+write_report "$WORK/mixed.xml" \
+  "pass:$SEL:test_version:$SELF" \
+  "pass:$SEL:test_output_serial_expressions:$SELF" \
+  "pass:$SEL:test_documented_stub:$SELF" \
+  "pass:$UTL:test_generate:$UTLF" \
+  "pass:$SEL:test_real_select:$SELF"
+check "vacuous passes filtered, genuine kept" "$WORK/mixed.xml" "$WORK/nolist.txt" \
+  passing=5 promotions=1 suppressed=4 regressions=0
+if grep -q "^$SELF::test_real_select$" "$WORK/delta.txt"; then
+  echo "ok   surviving candidate is the genuine test"
+else
+  echo "FAIL genuine candidate missing from the delta"
+  failures=$((failures + 1))
+fi
+if grep -q "$SELF::test_version	body is a leading return (stub)" "$WORK/delta.txt" \
+  && grep -q "$UTLF::test_generate	module issues no client calls" "$WORK/delta.txt"; then
+  echo "ok   suppressed candidates are recorded in the delta with reasons"
+else
+  echo "FAIL suppressed candidates or their reasons missing from the delta"
+  failures=$((failures + 1))
+fi
+
+# True negative for the stub guard: a test whose first statement is
+# `return <expr>` is a delegation test, not a stub. The return value IS the
+# test, so it must survive the filter.
+write_report "$WORK/delegate.xml" "pass:$SEL:test_delegates_via_return:$SELF"
+check "return-expression test is kept" "$WORK/delegate.xml" "$WORK/nolist.txt" \
+  passing=1 promotions=1 suppressed=0 regressions=0
+
+# Symmetric control: a docstring followed by real work is genuine, not a stub.
+write_report "$WORK/docwork.xml" "pass:$SEL:test_docstring_then_assert:$SELF"
+check "docstring-then-work test is kept" "$WORK/docwork.xml" "$WORK/nolist.txt" \
+  passing=1 promotions=1 suppressed=0 regressions=0
+
+# A candidate whose source cannot be found or whose function cannot be located
+# is kept, not dropped: the filter only removes tests it positively recognises
+# as vacuous. These node IDs resolve to the touched-empty test_s3.py, which
+# parses to no functions at all.
+write_report "$WORK/unknown.xml" "pass:$MOD:test_mystery:$FILE"
+check "unrecognised candidate is kept" "$WORK/unknown.xml" "$WORK/nolist.txt" \
+  passing=1 promotions=1 suppressed=0 regressions=0
+
 # A test on the allowlist that did not pass. Should be unreachable, since the
 # gate runs the same list on every pull request, which is exactly why the
 # nightly has to be loud about it.
@@ -122,13 +243,13 @@ check "regression" "$WORK/empty.xml" "$WORK/three.txt" \
 write_report "$WORK/teardown.xml" \
   "pass:$MOD:test_a:$FILE" \
   "error:$MOD:test_a:$FILE"
-write_allowlist "$WORK/none.txt" "# nothing"
-check "teardown error is not a pass" "$WORK/teardown.xml" "$WORK/none.txt" \
+write_allowlist "$WORK/nolist.txt" "# nothing"
+check "teardown error is not a pass" "$WORK/teardown.xml" "$WORK/nolist.txt" \
   passing=0 promotions=0 regressions=0
 
 # A skip is not a pass either, the same rule the gate applies.
 write_report "$WORK/skipped.xml" "skipped:$MOD:test_a:$FILE"
-check "skip is not a pass" "$WORK/skipped.xml" "$WORK/none.txt" \
+check "skip is not a pass" "$WORK/skipped.xml" "$WORK/nolist.txt" \
   passing=0 promotions=0
 
 # Class-based tests: the module path comes from the `file` attribute and
@@ -179,7 +300,7 @@ for i in $(seq 1 150); do
   many+=("pass:$MOD:test_${i}:$FILE")
 done
 write_report "$WORK/many.xml" "${many[@]}"
-check "large delta" "$WORK/many.xml" "$WORK/none.txt" promotions=150
+check "large delta" "$WORK/many.xml" "$WORK/nolist.txt" promotions=150
 if grep -q "Showing 100 of 150" "$WORK/body.md"; then
   echo "ok   body says what it left out"
 else

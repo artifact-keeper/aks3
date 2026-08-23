@@ -18,7 +18,7 @@
 # tracking issue, a machine-readable delta, and KEY=VALUE lines on stdout for
 # $GITHUB_OUTPUT:
 #
-#   passing, collected, promotions, regressions, fingerprint
+#   passing, collected, promotions, suppressed, regressions, fingerprint
 #
 # Nothing here talks to GitHub or to the network, so it runs standalone against
 # a fabricated report, which is how its own behaviour is checked.
@@ -143,12 +143,154 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "$ALLOWLIST"
 LC_ALL=C sort -u "$WORK/allowed.txt" -o "$WORK/allowed.txt"
 
-LC_ALL=C comm -23 "$WORK/passing.txt" "$WORK/allowed.txt" > "$WORK/promotions.txt"
+LC_ALL=C comm -23 "$WORK/passing.txt" "$WORK/allowed.txt" > "$WORK/promotions_raw.txt"
 LC_ALL=C comm -13 "$WORK/passing.txt" "$WORK/allowed.txt" > "$WORK/regressions.txt"
+
+# A promotion candidate is a test that passed and is not yet on the allowlist,
+# but "passed" only means nothing the test emitted failed, errored or skipped.
+# That cannot tell a test which exercised the server from one that never touched
+# it, so a test whose body is a leading `return` (a stub, disabled upstream) and
+# a test that only asserts on the suite's own helpers both read as green. Those
+# are noise on the candidate list at best, and for an unimplemented feature they
+# are misleading, so they are filtered out of the *candidate surface* here.
+#
+# This changes nothing the pull-request gate sees. The pass definition, the
+# passing count, the allowlist and the regression set are all untouched; only
+# which passing-but-unlisted tests get surfaced as worth promoting is narrowed.
+#
+# The filter is a source-inspection heuristic, not a proof. It reads each
+# candidate's function body out of the pinned s3-tests checkout under
+# --suite-root and drops two shapes:
+#
+#   * a test whose first statement (past an optional docstring) is `return`,
+#     which means the rest of the body never runs;
+#   * a test in a module that issues no client calls (test_utils.py by default,
+#     overridable with RECON_DROP_MODULES as a comma-separated list of
+#     basenames).
+#
+# Its limits, stated plainly: it does not prove a surviving candidate ever
+# reaches the server. A test can be vacuous in ways this cannot see (an early
+# `pytest.skip()`, an assertion only on a fixture, a client call that is dead
+# behind a condition), and a candidate whose source is missing, unparseable or
+# whose function cannot be located is kept rather than dropped, so the filter
+# never hides a test it did not positively recognise as vacuous. It reduces
+# noise; it is not a guarantee.
+SUITE_ROOT="$SUITE_ROOT" \
+RECON_DROP_MODULES="${RECON_DROP_MODULES:-test_utils.py}" \
+python3 - "$WORK/promotions_raw.txt" "$WORK/promotions.txt" "$WORK/promotions_vacuous.txt" <<'PY'
+import ast
+import os
+import sys
+
+suite_root = os.environ["SUITE_ROOT"]
+raw_path, surfaced_path, suppressed_path = sys.argv[1], sys.argv[2], sys.argv[3]
+drop_modules = {
+    m.strip() for m in os.environ.get("RECON_DROP_MODULES", "").split(",") if m.strip()
+}
+
+# Cache of parsed module trees, keyed by absolute source path. Value is the AST
+# module, or None if the file is absent or does not parse.
+_trees = {}
+
+
+def tree_for(relpath):
+    path = os.path.join(suite_root, relpath)
+    if path not in _trees:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                _trees[path] = ast.parse(handle.read())
+        except (OSError, SyntaxError, ValueError):
+            _trees[path] = None
+    return _trees[path]
+
+
+def find_func(tree, class_path, name):
+    # Walk class scopes named in the node ID, then find the function. Returns
+    # the FunctionDef/AsyncFunctionDef, or None if it cannot be located.
+    scope = tree.body
+    for cls in class_path:
+        nxt = None
+        for node in scope:
+            if isinstance(node, ast.ClassDef) and node.name == cls:
+                nxt = node.body
+                break
+        if nxt is None:
+            return None
+        scope = nxt
+    for node in scope:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return node
+    return None
+
+
+def is_leading_return(func):
+    body = func.body
+    idx = 0
+    # Skip a leading docstring.
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(getattr(body[0], "value", None), ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        idx = 1
+    # Only a bare valueless `return` is a stub. `return client.call(...)` is a
+    # delegation test whose return expression IS the test, so a value-carrying
+    # return must never be dropped. Both #35 stubs are bare returns (value None).
+    return (
+        idx < len(body)
+        and isinstance(body[idx], ast.Return)
+        and body[idx].value is None
+    )
+
+
+def reason(node_id):
+    # Returns a suppression reason string, or None to keep the candidate.
+    parts = node_id.split("::")
+    relpath = parts[0]
+    if not relpath.endswith(".py"):
+        return None  # Not a resolvable source file; keep it.
+    if os.path.basename(relpath) in drop_modules:
+        return "module issues no client calls"
+    if len(parts) < 2:
+        return None
+    name = parts[-1].split("[", 1)[0]  # Strip a parametrization suffix.
+    class_path = parts[1:-1]
+    tree = tree_for(relpath)
+    if tree is None:
+        return None  # Source missing or unparseable; keep it.
+    func = find_func(tree, class_path, name)
+    if func is None:
+        return None  # Cannot locate the function; keep it.
+    if is_leading_return(func):
+        return "body is a leading return (stub)"
+    return None
+
+
+with open(raw_path, encoding="utf-8") as handle:
+    candidates = [line.rstrip("\n") for line in handle if line.strip()]
+
+surfaced, suppressed = [], []
+for node_id in candidates:
+    why = reason(node_id)
+    if why is None:
+        surfaced.append(node_id)
+    else:
+        suppressed.append((node_id, why))
+
+with open(surfaced_path, "w", encoding="utf-8") as handle:
+    for node_id in surfaced:
+        handle.write(node_id + "\n")
+
+with open(suppressed_path, "w", encoding="utf-8") as handle:
+    for node_id, why in suppressed:
+        handle.write("{}\t{}\n".format(node_id, why))
+PY
 
 passing=$(wc -l < "$WORK/passing.txt" | tr -d ' ')
 collected=$(cat "$WORK/collected.txt")
 promotions=$(wc -l < "$WORK/promotions.txt" | tr -d ' ')
+suppressed=$(wc -l < "$WORK/promotions_vacuous.txt" | tr -d ' ')
 regressions=$(wc -l < "$WORK/regressions.txt" | tr -d ' ')
 
 # GNU coreutils on the runner, BSD on a maintainer's laptop, and the digest has
@@ -175,13 +317,18 @@ fingerprint=$({
 if [ -n "$DELTA" ]; then
   {
     echo "# Full s3-tests recon delta against tests/compliance/allowlist.txt."
-    echo "# collected=${collected} passing=${passing} promotions=${promotions} regressions=${regressions}"
+    echo "# collected=${collected} passing=${passing} promotions=${promotions} regressions=${regressions} suppressed=${suppressed}"
     echo
-    echo "[promotion candidates: passing, not on the allowlist]"
+    echo "[promotion candidates: passing, not on the allowlist, not filtered as vacuous]"
     cat "$WORK/promotions.txt"
     echo
     echo "[regressions: on the allowlist, not passing]"
     cat "$WORK/regressions.txt"
+    echo
+    echo "[suppressed: passing and unlisted, but filtered as vacuous (node_id<TAB>reason)]"
+    echo "# A source-inspection heuristic dropped these from the candidate list."
+    echo "# It reduces noise; it is not a guarantee a surviving candidate reached the server."
+    cat "$WORK/promotions_vacuous.txt"
   } > "$DELTA"
 fi
 
@@ -226,6 +373,13 @@ list_block() {
     echo
   fi
 
+  if [ "$suppressed" -gt 0 ]; then
+    echo "## Filtered as vacuous"
+    echo
+    echo "These ${suppressed} test(s) passed and are not on the allowlist, but a source-inspection heuristic dropped them from the candidate list above: either the body is a leading \`return\` (a stub, so nothing after it runs) or the module issues no client calls. They read as green without proving anything about the server, which for an unimplemented feature is worse than useless. This is a noise filter, not a proof: it only drops tests it can positively recognise as vacuous, and a surviving candidate is still not guaranteed to reach the server. The full list with reasons is in the \`s3-tests-recon\` artifact's delta file."
+    echo
+  fi
+
   echo "This body is rewritten by the nightly workflow whenever the delta changes, so notes are better left as comments. Last run: ${RUN_URL:-not run from CI}"
 } > "$BODY"
 
@@ -233,6 +387,7 @@ list_block() {
   echo "passing=${passing}"
   echo "collected=${collected}"
   echo "promotions=${promotions}"
+  echo "suppressed=${suppressed}"
   echo "regressions=${regressions}"
   echo "fingerprint=${fingerprint}"
 }
