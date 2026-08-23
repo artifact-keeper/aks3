@@ -37,6 +37,12 @@ s3tests/functional/test_s3.py::test_bucket_create_naming_dns_dash_dot
 s3tests/functional/test_s3.py::test_bucketv2_notexist
 s3tests/functional/test_s3.py::test_object_write_to_nonexist_bucket
 
+# --- Operations against a bucket deleted mid-test ---------------------------
+# Both end by deleting their own bucket, so they clear the teardown gap, and
+# both assert 404 NoSuchBucket rather than relying on a feature aks3 lacks.
+s3tests/functional/test_s3.py::test_object_raw_authenticated_bucket_gone
+s3tests/functional/test_s3.py::test_atomic_write_bucket_gone
+
 # --- SigV4 rejection paths --------------------------------------------------
 s3tests/functional/test_s3.py::test_list_buckets_invalid_auth
 s3tests/functional/test_s3.py::test_list_buckets_bad_auth
