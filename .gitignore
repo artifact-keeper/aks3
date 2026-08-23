@@ -2,6 +2,9 @@
 *.pem
 .DS_Store
 /tests/compliance/s3-tests/
+# Left behind by importing recon_isolation.py, which pytest does from the
+# suite's working directory rather than from this one.
+__pycache__/
 
 # Internal planning and process docs stay local
 /docs/superpowers/
