@@ -43,3 +43,8 @@ tokio-rustls = "0.26"
 rustls-pemfile = "2"
 tempfile = "3"
 dashmap = "6"
+# Property testing. Pinned to a minor series rather than a bare "1" so that a
+# new strategy or shrinker landing upstream is a deliberate bump: proptest
+# generates the inputs the suite runs on, and a silent change to what it
+# generates is a silent change to what CI covers.
+proptest = "1.11"
