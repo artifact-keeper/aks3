@@ -246,7 +246,14 @@ fn engine_body(key: &str, seed: u64) -> Vec<u8> {
 /// killed mid-operation, and in the rare case that it runs out of work first it
 /// blocks on standard input, which the parent holds open, rather than exiting
 /// into a race over whether the kill found a live process.
+///
+/// Ignored, so an ordinary `cargo test` does not run a test whose only outcome
+/// is to return immediately: an always-passing no-op is noise in the count, and
+/// one that would do something quite different if a stray `AKS3_CRASH_*` were
+/// exported is worse than noise. The parent passes `--ignored` alongside the
+/// filter, which is how it gets the one test it wants.
 #[test]
+#[ignore = "the re-exec entry point of the crash loop, not a test of its own"]
 fn crash_child_entry_point() {
     let Ok(mode) = std::env::var(CHILD_MODE) else {
         return;
@@ -283,7 +290,9 @@ fn crash_child_entry_point() {
     println!("{EXHAUSTED}");
     let _ = std::io::stdout().flush();
     // Blocks until the parent's kill arrives: the parent keeps the write end of
-    // this pipe, so it never reaches end of file on its own.
+    // this pipe, so it never reaches end of file on its own. If the parent dies
+    // instead of killing, the pipe closes with it and this returns, so no child
+    // outlives the run that started it.
     let _ = std::io::stdin().read_to_end(&mut Vec::new());
 }
 
@@ -374,6 +383,8 @@ impl Killable {
         let child = Command::new(exe)
             .arg(CHILD_TEST)
             .arg("--exact")
+            // The entry point carries `#[ignore]`, so it takes asking for.
+            .arg("--ignored")
             .arg("--nocapture")
             .arg("--test-threads=1")
             .env(CHILD_MODE, mode)
@@ -549,6 +560,11 @@ struct Expectation<'a> {
     /// name rather than picking a new one, so the number of operations that were
     /// ever in flight across all the crashes so far is the bound that says
     /// orphans do not accumulate.
+    ///
+    /// The delete leg does better than that sum. Deleters are sequential, so it
+    /// carries the count the writers actually left and allows one more per
+    /// crashed deleter, which is a bound on what the delete leg itself can add
+    /// rather than on everything either leg was permitted.
     max_orphans: usize,
 }
 
@@ -617,6 +633,12 @@ async fn collect_keys(objects: &Path) -> Result<BTreeMap<String, KeyState>, Stri
 /// This is the invariant a `SIGKILL` can actually falsify, and the one that
 /// catches a publication order written the wrong way round: a manifest reaching
 /// disk before the data it describes leaves exactly this state behind.
+///
+/// The returned orphan count leans on a Phase 0 fact: a key has one data file
+/// name, so a crash can strand at most one file per key and the next write to
+/// that key reuses the name rather than adding to it. Versioning mints a name
+/// per version, at which case orphans really can pile up under one key, and both
+/// this count and the bounds stated over it need revisiting then.
 fn check_manifests(found: &BTreeMap<String, KeyState>) -> Result<usize, String> {
     let mut orphans = 0;
     for (key, state) in found {
@@ -683,13 +705,20 @@ async fn check_all_or_nothing(
     Ok(())
 }
 
-/// Reopen the store, check everything that must hold after a crash, and report
-/// which keys came back readable.
-///
-/// The survivors are what the next round is aimed at: a deleter racing ahead of
-/// its own acknowledgements means the parent cannot predict what a crash left,
-/// but it can read it back and pick up from there.
-async fn verify(root: &Path, seed: u64, expect: &Expectation<'_>) -> Result<Vec<usize>, String> {
+/// What a store held when it was last verified.
+struct Surveyed {
+    /// Keys that read back. What the next round is aimed at: a child racing
+    /// ahead of its own acknowledgements means the parent cannot predict what a
+    /// crash left, but it can read it back and pick up from there.
+    alive: Vec<usize>,
+    /// Data files no manifest names, as counted by [`check_manifests`]. Carried
+    /// forward so a later round can bound its own share of them rather than
+    /// re-allowing everything the earlier rounds were allowed.
+    orphans: usize,
+}
+
+/// Reopen the store and check everything that must hold after a crash.
+async fn verify(root: &Path, seed: u64, expect: &Expectation<'_>) -> Result<Surveyed, String> {
     // A staged file that a crash left behind is swept by `open`, but whether a
     // crash left one depends on where it landed. Seeding one makes the sweep
     // assertion below bite on every iteration rather than only the lucky ones.
@@ -750,7 +779,7 @@ async fn verify(root: &Path, seed: u64, expect: &Expectation<'_>) -> Result<Vec<
                 .is_some_and(|entry| !entry.delete_marker)
         })
         .collect();
-    Ok(alive)
+    Ok(Surveyed { alive, orphans })
 }
 
 // ---------------------------------------------------------------------------
@@ -784,14 +813,45 @@ fn archive(scratch: &Path, label: &str) -> String {
     }
 }
 
-/// Archive the evidence, then fail with the seed that reproduces the run.
-fn fail(scratch: &Path, label: &str, seed: u64, problem: &str) -> ! {
+/// Archive the evidence, then fail, saying what reproduces the run.
+///
+/// `reproduce` is the caller's, because what to set [`SEED_VAR`] to is not the
+/// same question in both legs. It seeds a whole run, and the engine loop derives
+/// a fresh seed per iteration from it, so printing the derived one there would
+/// hand the reader a value that replays a different store. The derived seed
+/// still labels the archive, since that is a name rather than an instruction.
+fn fail(scratch: &Path, label: &str, reproduce: &str, problem: &str) -> ! {
+    // Into the archive as well as onto the terminal: whoever opens the tarball
+    // later should not need the log of the run that produced it.
+    record(&scratch.join("acked.log"), &format!("FAILED: {problem}"));
     let path = archive(scratch, label);
     panic!(
         "{problem}\n\
-         reproduce with {SEED_VAR}={seed}\n\
+         reproduce with {reproduce}\n\
          post-crash scratch directory archived at {path}"
     );
+}
+
+/// [`fail`] with the end-to-end leg's labels filled in. It has one iteration and
+/// uses the run seed directly, so what reproduces it is just that seed.
+fn fail_e2e(scratch: &Path, seed: u64, problem: &str) -> ! {
+    fail(
+        scratch,
+        &format!("e2e-{seed}"),
+        &format!("{SEED_VAR}={seed}"),
+        problem,
+    )
+}
+
+/// The message out of a caught panic, whatever shape the payload came in.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_owned()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "a panic carrying no message".to_owned()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -850,7 +910,10 @@ fn one_iteration(scratch: &Path, seed: u64, rng: &mut Rng) -> Result<String, Str
     let mut crashes = 0;
     let mut in_flight = 0;
     let mut acked: Vec<usize> = Vec::new();
-    let mut alive: Vec<usize> = Vec::new();
+    let mut store = Surveyed {
+        alive: Vec::new(),
+        orphans: 0,
+    };
     let mut exhausted = false;
     let mut next = 0;
     for round in 0..PUT_ROUNDS {
@@ -873,7 +936,7 @@ fn one_iteration(scratch: &Path, seed: u64, rng: &mut Rng) -> Result<String, Str
 
         crashes += 1;
         in_flight += concurrency;
-        alive = runtime.block_on(verify(
+        store = runtime.block_on(verify(
             &root,
             seed,
             &Expectation {
@@ -889,16 +952,22 @@ fn one_iteration(scratch: &Path, seed: u64, rng: &mut Rng) -> Result<String, Str
     // PUT's, so sampling it once per iteration would leave a reordered delete
     // mostly undetected; deleting through what one writer left costs no further
     // PUTs and multiplies the sample.
+    //
+    // The bound on orphans tightens here rather than carrying the writers'
+    // allowance forward. What the writers were permitted is one thing; what they
+    // actually left is another, and the delete leg is judged against the second
+    // plus one per crashed deleter, which is all a sequential deleter can add.
+    let left_by_writers = store.orphans;
     let mut removed: Vec<usize> = Vec::new();
     let mut deleters = 0;
-    while alive.len() >= 2 && deleters < DELETE_ROUNDS {
+    while store.alive.len() >= 2 && deleters < DELETE_ROUNDS {
         deleters += 1;
         // From the middle: everything below is untouched by this deleter and
         // must still read back, since a crashed delete may not take its
         // neighbours with it, and everything above is work it can really do.
-        let split = alive.len() / 2;
-        let survivors: Vec<usize> = alive[..split].to_vec();
-        let start = alive[split];
+        let split = store.alive.len() / 2;
+        let survivors: Vec<usize> = store.alive[..split].to_vec();
+        let start = store.alive[split];
 
         let acks = usize::try_from(1 + rng.below(2)).expect("a small count fits usize");
         let mut deleter = Killable::spawn_child("delete", &root, seed, start, 1);
@@ -908,14 +977,13 @@ fn one_iteration(scratch: &Path, seed: u64, rng: &mut Rng) -> Result<String, Str
         record(&log, &format!("delete from {start} acked {removed:?}"));
 
         crashes += 1;
-        in_flight += 1;
-        alive = runtime.block_on(verify(
+        store = runtime.block_on(verify(
             &root,
             seed,
             &Expectation {
                 present: &survivors,
                 absent: &removed,
-                max_orphans: in_flight,
+                max_orphans: left_by_writers + deleters,
             },
         ))?;
     }
@@ -933,13 +1001,24 @@ fn one_iteration(scratch: &Path, seed: u64, rng: &mut Rng) -> Result<String, Str
 }
 
 /// The loop. Each iteration gets its own store and its own seed, and prints the
-/// seed before it runs, so the line above a failure is what reproduces it.
+/// seed before it runs.
 ///
-/// The seed fixes the object bytes and every kill point, so a rerun under
-/// [`SEED_VAR`] replays the same decisions. What it cannot replay is where in an
-/// operation each kill landed, which is a race with the machine; a crash bug the
-/// loop finds is reproducible in the sense that matters, namely that the store
-/// it left behind is in the archive the failure names.
+/// [`SEED_VAR`] seeds the loop, not an iteration: it fixes the bytes of every
+/// object and every kill point, so a rerun replays the same decisions in the
+/// same order. What it cannot replay is where inside an operation each kill
+/// landed, which is a race with the machine. A crash bug is therefore
+/// reproducible in the sense that matters, which is that the store that
+/// exhibited it is in the archive the failure names.
+///
+/// Every failure goes through [`fail`], including one that arrived as a panic.
+/// A panic left to propagate would unwind past `scratch` and `TempDir` would
+/// delete the post-crash store on the way out, which is exactly backwards: a
+/// child that died on its own, or one that stopped acknowledging, is the case
+/// where what is on disk is the whole of the evidence. Catching is preferred
+/// over turning the two panicking helpers into `Result`, because it also covers
+/// the sites that are not theirs, a `tempfile` that cannot be made or a
+/// `kill(1)` that will not run, and the payload carries the same diagnostics
+/// the `Result` would have.
 #[test]
 fn engine_crash_loop() {
     let base = run_seed();
@@ -951,15 +1030,27 @@ fn engine_crash_loop() {
         let seed = splitmix64(&mut rng.0);
         let scratch = tempfile::tempdir().expect("a scratch directory");
         println!("crash iteration {}/{total} seed={seed}", i + 1);
-        match one_iteration(scratch.path(), seed, &mut rng) {
-            Ok(note) => println!("crash iteration {}/{total} ok: {note}", i + 1),
-            Err(problem) => fail(
-                scratch.path(),
-                &format!("engine-{seed}"),
-                seed,
-                &format!("crash iteration {}/{total}: {problem}", i + 1),
+
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            one_iteration(scratch.path(), seed, &mut rng)
+        }));
+        let problem = match ran {
+            Ok(Ok(note)) => {
+                println!("crash iteration {}/{total} ok: {note}", i + 1);
+                continue;
+            }
+            Ok(Err(problem)) => problem,
+            Err(payload) => panic_message(&payload),
+        };
+        fail(
+            scratch.path(),
+            &format!("engine-{seed}"),
+            &format!(
+                "{SEED_VAR}={base}, which fails at iteration {} of {total}",
+                i + 1
             ),
-        }
+            &format!("crash iteration {}/{total}: {problem}", i + 1),
+        );
     }
 }
 
@@ -1070,9 +1161,8 @@ async fn e2e_sigkill_mid_put_recovers() {
         let key = key_for(*index);
         let got = c.get_object().bucket(BUCKET).key(&key).send().await;
         let Ok(got) = got else {
-            fail(
+            fail_e2e(
                 scratch.path(),
-                &format!("e2e-{seed}"),
                 seed,
                 &format!("{key} was acknowledged before the kill and is gone after the restart"),
             );
@@ -1084,44 +1174,59 @@ async fn e2e_sigkill_mid_put_recovers() {
             .expect("reading the object")
             .into_bytes();
         if bytes[..] != content_for(&key, seed, E2E_BODY)[..] {
-            fail(
+            fail_e2e(
                 scratch.path(),
-                &format!("e2e-{seed}"),
                 seed,
                 &format!("{key} read back {} bytes that do not match", bytes.len()),
             );
         }
     }
 
-    // Healthy, not merely alive: the restarted server still accepts writes into
-    // the recovered store and serves them back.
+    still_serving(&c, scratch.path(), seed).await;
+    restarted.proc.kill_9();
+}
+
+/// Healthy, not merely alive: the restarted server takes a write into the
+/// recovered store and serves it back.
+///
+/// Failures here go through [`fail_e2e`] rather than `expect`, because the store
+/// this ran against is the evidence and an unwind past the caller's `TempDir`
+/// would delete it.
+async fn still_serving(c: &aws_sdk_s3::Client, scratch: &Path, seed: u64) {
     let key = "after-the-crash";
     let body = content_for(key, seed, 4096);
-    c.put_object()
+    let wrote = c
+        .put_object()
         .bucket(BUCKET)
         .key(key)
         .body(body.clone().into())
         .send()
-        .await
-        .expect("writing to the recovered store");
-    let got = c
-        .get_object()
-        .bucket(BUCKET)
-        .key(key)
-        .send()
-        .await
-        .expect("reading back from the recovered store");
-    let bytes = got
-        .body
-        .collect()
-        .await
-        .expect("reading the object")
-        .into_bytes();
-    assert_eq!(
-        &bytes[..],
-        &body[..],
-        "the recovered store lost a fresh write"
-    );
-
-    restarted.proc.kill_9();
+        .await;
+    let read = match wrote {
+        Ok(_) => c.get_object().bucket(BUCKET).key(key).send().await,
+        Err(e) => fail_e2e(
+            scratch,
+            seed,
+            &format!("the recovered store refused a fresh write: {e}"),
+        ),
+    };
+    let streamed = match read {
+        Ok(got) => got.body.collect().await,
+        Err(e) => fail_e2e(
+            scratch,
+            seed,
+            &format!("the recovered store would not serve a fresh write back: {e}"),
+        ),
+    };
+    let fresh = match streamed {
+        Ok(bytes) => bytes.into_bytes(),
+        Err(e) => fail_e2e(
+            scratch,
+            seed,
+            &format!("the fresh write's body stopped arriving: {e}"),
+        ),
+    };
+    if fresh[..] != body[..] {
+        fail_e2e(scratch, seed, "the recovered store lost a fresh write");
+    }
 }
