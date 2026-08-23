@@ -93,8 +93,13 @@ if [ -z "$number" ]; then
   exit 0
 fi
 
-if gh issue view "$number" --repo "$REPO" --json body --jq .body \
-  | grep -qF "findings-fingerprint: ${FINGERPRINT}"; then
+# Captured rather than piped straight into grep. `grep -q` stops reading at the
+# first match, and a body past the pipe buffer would then leave `gh` writing
+# into a closed pipe: SIGPIPE, a failed element, and under `pipefail` a failed
+# pipeline, so a long-running issue would start reporting itself as an error at
+# whatever size crossed the threshold.
+existing=$(gh issue view "$number" --repo "$REPO" --json body --jq .body)
+if printf '%s' "$existing" | grep -qF "findings-fingerprint: ${FINGERPRINT}"; then
   echo "#${number} already describes these findings; left alone."
   exit 0
 fi

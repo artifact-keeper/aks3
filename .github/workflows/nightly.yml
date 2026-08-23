@@ -35,7 +35,7 @@ on:
 # scheduled run is halfway through the suite should wait rather than throw that
 # hour away.
 concurrency:
-  group: nightly
+  group: ${{ github.workflow }}
   cancel-in-progress: false
 
 permissions:
@@ -101,12 +101,23 @@ jobs:
           QUICK: ${{ inputs.quick }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          # 900 against the 1053 the pinned revision collects: low enough that
+          # upstream deleting a module is not an outage, high enough that a
+          # suite which collapsed during collection cannot report an empty delta
+          # and close the standing issue on the strength of a run that never
+          # happened. Off for a quick dispatch, which collects about fifty tests
+          # on purpose.
+          floor=(--min-collected 900)
+          if [ "$QUICK" = "true" ]; then
+            floor=()
+          fi
           tests/compliance/recon-delta.sh \
             --junit "${RUNNER_TEMP}/pytest.xml" \
             --allowlist tests/compliance/allowlist.txt \
             --suite-root tests/compliance/s3-tests \
             --body "${RUNNER_TEMP}/issue-body.md" \
-            --delta "${RUNNER_TEMP}/delta.txt" >> "$GITHUB_OUTPUT"
+            --delta "${RUNNER_TEMP}/delta.txt" \
+            ${floor[@]+"${floor[@]}"} >> "$GITHUB_OUTPUT"
           if [ "$QUICK" = "true" ]; then
             {
               echo "**Quick dispatch.** Only one module of the suite ran, so every allowlisted test in the rest of it counts as a regression below and none of it means anything. The pipeline running at all is what this proves."
@@ -179,10 +190,17 @@ jobs:
   # latter is LazyFS, and it is not written yet.
   #
   # This one has no tracking issue, unlike the recon above. Its finding set is a
-  # boolean, and a failure here is loud on its own: the run goes red, GitHub
-  # notifies on a failed scheduled workflow, and the seed and the post-crash
-  # store are attached below. An issue would add a place for the same fact to
-  # go stale in.
+  # boolean, the run goes red, and the seed and the post-crash store are
+  # attached below; whether that reaches anyone by mail depends on each
+  # account's notification settings rather than on anything this repository
+  # controls, so the artifact and the red run are what it rests on. An issue
+  # would add a place for the same fact to go stale in.
+  #
+  # What that costs is liveness: nothing here would say so if the schedule
+  # itself stopped firing. The recon's tracking issue is the answer, and it only
+  # works because both jobs are on one schedule. Splitting them into separate
+  # workflows would leave this one able to die quietly, which is the failure
+  # mode the standing tracking-issue rule exists to prevent.
   crash-loop:
     runs-on: ubuntu-latest
     timeout-minutes: 60

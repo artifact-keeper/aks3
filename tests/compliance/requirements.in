@@ -18,6 +18,10 @@
 # run installs from the same file: --generate-hashes records the hash of every
 # distribution file of a pinned version, wheels for other platforms included,
 # so pip picks the right wheel and still finds its hash.
+#
+# The 3.12 half of that is also in .python-version beside this file, which is
+# where Dependabot looks: it resolves with an interpreter of its own choosing,
+# and a bump resolved under a different one would quietly move the markers.
 PyYAML
 boto3 >=1.0.0
 botocore

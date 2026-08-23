@@ -42,6 +42,22 @@ import os
 import pytest
 import s3tests.functional
 
+# Checked at import, because the failure without it is silent and misleading.
+# Setting an attribute nobody reads is not an error in Python: the hook would
+# keep running, every test would go back to sharing one prefix, and the recon
+# would report seventeen of the eighteen allowlisted tests as regressions. The
+# job would go red pointing at the compliance gate, which would be the one thing
+# that was fine.
+for _name in ("prefix", "choose_bucket_prefix"):
+    if not hasattr(s3tests.functional, _name):
+        raise RuntimeError(
+            f"s3tests.functional has no {_name!r}, so rotating the bucket prefix "
+            "would do nothing and the recon would blame the allowlist for it. "
+            "S3_TESTS_REF in run-s3-tests.sh has moved to a revision this plugin "
+            "does not know: re-read s3tests/functional/__init__.py and update the "
+            "hook below, in the same commit as the pin."
+        )
+
 
 def _template():
     """The bucket prefix template from the same config file the suite reads."""

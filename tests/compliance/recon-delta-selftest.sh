@@ -193,6 +193,39 @@ else
   failures=$((failures + 1))
 fi
 
+# The floor. A run that collected only what the allowlist names produces an
+# empty delta, which is indistinguishable from a healthy night and would close
+# the tracking issue on the strength of a suite that never ran.
+write_report "$WORK/short.xml" \
+  "pass:$MOD:test_a:$FILE" \
+  "pass:$MOD:test_b:$FILE"
+if "$DELTA_SCRIPT" --junit "$WORK/short.xml" --allowlist "$WORK/both.txt" \
+  --suite-root "$WORK/suite" --body "$WORK/body.md" --min-collected 900 \
+  > "$WORK/out" 2>&1; then
+  echo "FAIL a collection that fell off a cliff was accepted"
+  failures=$((failures + 1))
+else
+  echo "ok   floor rejects a truncated collection"
+fi
+# And it still says what it found, so the run is not silent about why.
+if grep -q "collected=2" "$WORK/out"; then
+  echo "ok   floor still reports the counts it rejected"
+else
+  echo "FAIL floor failed without saying what it counted"
+  failures=$((failures + 1))
+fi
+
+# The same report is fine under a floor it clears, and fine with none at all.
+check "floor that is met" "$WORK/short.xml" "$WORK/both.txt" collected=2
+if "$DELTA_SCRIPT" --junit "$WORK/short.xml" --allowlist "$WORK/both.txt" \
+  --suite-root "$WORK/suite" --body "$WORK/body.md" --min-collected 2 \
+  > /dev/null 2>&1; then
+  echo "ok   floor exactly met passes"
+else
+  echo "FAIL floor rejected a report that met it exactly"
+  failures=$((failures + 1))
+fi
+
 # A report that is not XML at all is a broken run, not an empty delta.
 echo "not xml" > "$WORK/broken.xml"
 if "$DELTA_SCRIPT" --junit "$WORK/broken.xml" --allowlist "$WORK/one.txt" \

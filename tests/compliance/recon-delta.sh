@@ -26,7 +26,10 @@
 # Usage:
 #
 #   recon-delta.sh --junit FILE --allowlist FILE --suite-root DIR \
-#     --body FILE [--delta FILE]
+#     --body FILE [--delta FILE] [--min-collected N]
+#
+# --min-collected is the floor described below, and the reason this script can
+# fail rather than only report.
 
 set -euo pipefail
 
@@ -35,6 +38,7 @@ ALLOWLIST=""
 SUITE_ROOT=""
 BODY=""
 DELTA=""
+MIN_COLLECTED=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -43,6 +47,7 @@ while [ $# -gt 0 ]; do
     --suite-root) SUITE_ROOT="$2"; shift 2 ;;
     --body) BODY="$2"; shift 2 ;;
     --delta) DELTA="$2"; shift 2 ;;
+    --min-collected) MIN_COLLECTED="$2"; shift 2 ;;
     *) echo "recon-delta.sh: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -231,3 +236,18 @@ list_block() {
   echo "regressions=${regressions}"
   echo "fingerprint=${fingerprint}"
 }
+
+# The floor, last, so everything above is still written and still printed: a run
+# that trips it is one whose evidence is worth keeping.
+#
+# Every number here is a difference between two sets, and a report describing a
+# fraction of the suite produces a perfectly well-formed one. The bad case is
+# not a crash, it is silence: a run that collected only what the allowlist names
+# reports no promotions and no regressions, which is the shape of a healthy
+# night, and the tracking issue is closed on the strength of it. A collection
+# that fell off a cliff is a broken run, and this is what makes it say so.
+if [ -n "$MIN_COLLECTED" ] && [ "$collected" -lt "$MIN_COLLECTED" ]; then
+  echo "recon-delta.sh: the report describes ${collected} tests, below the floor of ${MIN_COLLECTED}" >&2
+  echo "The suite did not run as far as it should have, so the delta above describes a fraction of it and no conclusion may be drawn from an empty one. Look at the collection errors in the report before trusting anything here." >&2
+  exit 1
+fi

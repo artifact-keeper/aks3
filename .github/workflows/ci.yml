@@ -82,4 +82,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
+      # Milliseconds, and it rides here rather than only in the nightly because
+      # this is where a change to the delta arithmetic is made. The input that
+      # would exercise it for real takes an hour to produce, so a break would
+      # otherwise surface a night later, in the job that files the issue.
+      - run: tests/compliance/recon-delta-selftest.sh
       - run: tests/compliance/run-s3-tests.sh
