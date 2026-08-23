@@ -26,6 +26,7 @@ every process that inherited it. The hyphen makes that impossible.
 """
 
 import os
+import urllib.request
 import uuid
 
 import boto3
@@ -68,7 +69,7 @@ def credentials():
 
 @pytest.fixture(scope="session")
 def client_factory(endpoint, credentials):
-    """Builds clients that differ only in the config knob under test.
+    """Builds clients that differ only in the knob under test.
 
     Two settings are fixed for every client the suite makes:
 
@@ -80,18 +81,25 @@ def client_factory(endpoint, credentials):
     position is that retrying masks the bugs these tests exist to find; the
     default of five attempts is a client-side courtesy that has no place in a
     correctness gate.
+
+    `access_key` and `secret_key` override the harness's credentials, which is
+    how the bad-credentials test gets a client that will be refused. Passing
+    them to `session.client` is the supported way to do it; reaching into
+    `client._request_signer` afterwards would work today and is exactly the
+    kind of private-attribute grip that breaks on a botocore bump for reasons
+    nobody remembers.
     """
-    access_key, secret_key = credentials
+    harness_access_key, harness_secret_key = credentials
     session = boto3.session.Session()
 
-    def make(**config_kwargs):
+    def make(access_key=None, secret_key=None, **config_kwargs):
         s3_config = {"addressing_style": "path"}
         s3_config.update(config_kwargs.pop("s3", {}))
         return session.client(
             "s3",
             endpoint_url=endpoint,
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
+            aws_access_key_id=access_key or harness_access_key,
+            aws_secret_access_key=secret_key or harness_secret_key,
             region_name="us-east-1",
             config=Config(
                 s3=s3_config,
@@ -103,6 +111,30 @@ def client_factory(endpoint, credentials):
         )
 
     return make
+
+
+@pytest.fixture(scope="session")
+def http_get():
+    """Fetch a URL with urllib, ignoring any proxy the environment configures.
+
+    urllib's default opener honours http_proxy and HTTP_PROXY. The presigned
+    tests fetch from a loopback address, and a proxy in the environment would
+    either fail the connection or, worse, forward it somewhere that answered,
+    which would make those tests a statement about the proxy. `ProxyHandler({})`
+    is urllib's documented way to say "no proxies", and it costs nothing on the
+    machines that have none.
+
+    Returns a callable rather than an opener so callers cannot accidentally
+    reach for `urlopen` and lose the handler.
+    """
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def get(url, headers=None, timeout=30):
+        return opener.open(
+            urllib.request.Request(url, headers=headers or {}), timeout=timeout
+        )
+
+    return get
 
 
 @pytest.fixture(scope="session")
@@ -149,3 +181,32 @@ def report_versions():
     and the answer moves whenever Dependabot bumps the lockfile.
     """
     print(f"\nboto3 {boto3.__version__}, botocore {botocore.__version__}")
+
+
+_skipped = []
+
+
+def pytest_runtest_logreport(report):
+    if report.skipped:
+        _skipped.append(report.nodeid)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """A skip fails the run.
+
+    Same discipline the compliance gate next door enforces by counting JUnit
+    attributes, for the same reason: pytest exits 0 when every test skipped, and
+    a skip is what a missing feature, an unreachable server or a fixture that
+    quietly gave up all look like from the outside. Nothing in this suite has a
+    legitimate reason to skip - there are no optional dependencies and no
+    platform branches - so one appearing means something stopped being tested,
+    and that should be loud.
+
+    Written as a hook rather than a `-p no:skipping` flag so the reason is here,
+    next to the reasoning, rather than in an argument list in a shell script.
+    """
+    if _skipped:
+        print("\nthese tests skipped, which this suite treats as a failure:")
+        for node in _skipped:
+            print(f"  {node}")
+        session.exitstatus = 1

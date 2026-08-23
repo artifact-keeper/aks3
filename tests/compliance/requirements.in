@@ -39,7 +39,9 @@ tox
 # Not upstream's. The nightly recon runs the whole suite rather than the
 # allowlist, so one test that hangs against an unimplemented operation would
 # otherwise burn the job's hour on its own. Installed on the pull-request path
-# too, so the two runs share one environment and one lockfile.
+# too, so every run out of this directory shares one environment and one
+# lockfile: the allowlist gate, the recon, and the boto3 suite, which sets its
+# own per-test timeout in boto3-tests/pytest.ini.
 pytest-timeout
 
 # Also not upstream's: the boto3 golden-path suite in boto3-tests/ runs in this

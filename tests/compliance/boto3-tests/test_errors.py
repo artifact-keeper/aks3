@@ -108,10 +108,23 @@ def test_an_illegal_bucket_name(s3):
 
 def test_bad_credentials(client_factory, bucket):
     """A wrong secret is a signature error, not a 500 and not a success."""
-    client = client_factory()
-    client._request_signer._credentials = client._request_signer._credentials.__class__(
-        "wrong-key", "wrong-secret"
-    )
+    client = client_factory(access_key="wrong-key", secret_key="wrong-secret")
+
+    with pytest.raises(ClientError) as err:
+        client.list_objects_v2(Bucket=bucket)
+
+    assert err.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+
+
+def test_an_unknown_access_key(client_factory, bucket):
+    """An access key the server has never heard of is refused the same way.
+
+    Separate from the wrong-secret case because they fail at different points:
+    one has no secret to look up, the other looks one up and computes a
+    different signature with it. Both have to be a 403 and neither may leak
+    which of the two it was.
+    """
+    client = client_factory(access_key="nobody-in-particular", secret_key="whatever-secret")
 
     with pytest.raises(ClientError) as err:
         client.list_objects_v2(Bucket=bucket)

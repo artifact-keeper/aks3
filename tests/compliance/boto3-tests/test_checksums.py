@@ -13,12 +13,19 @@ implementations, and it is the single most likely thing to go wrong between
 aks3 and a real client. This file is the record of exactly where aks3 stands.
 
 **Phase 0 aks3 does not implement checksums.** s3s parses the headers and
-verifies the aws-chunked framing and its trailer signature, but no
-x-amz-checksum-* value is ever compared against the body, stored, or returned.
-Every test here that pins a divergence from AWS says so in its own words and
-carries a FIXME naming the Phase 1 checksum matrix. They pass today because
-they describe today; when the matrix lands they are the tests that fail and
-tell you what to change.
+verifies the aws-chunked framing and, on the signed path, its trailer
+signature, but no x-amz-checksum-* value is ever compared against the body,
+stored, or returned. Every test here that pins a divergence from AWS says so in
+its own words and carries a FIXME naming issue #38, the Phase 1 checksum
+matrix. They pass today because they describe today; when the matrix lands they
+are the tests that fail and tell you what to change.
+
+One divergence found alongside these is deliberately not tested here: a PUT
+that declares `Content-Encoding: aws-chunked` while signing a non-streaming
+payload sentinel is answered 200 with the chunk framing stored as object bytes.
+No SDK produces that combination, so there is no golden path to hang it on, and
+it is tracked as issue #37 with its reproduction. When that is fixed the test
+belongs here.
 
 There are two wire forms and this file exercises both:
 
@@ -135,7 +142,7 @@ def test_put_response_omits_the_checksum(s3, bucket):
     checksum, and invisible to a caller who never looks. It costs the caller
     the end-to-end confirmation the header exists to provide.
 
-    FIXME: when the Phase 1 checksum matrix lands, this assertion inverts: the
+    FIXME(#38): when the Phase 1 checksum matrix lands, this assertion inverts: the
     response should carry ChecksumCRC32 equal to crc32_b64(PAYLOAD).
     """
     response = s3.put_object(Bucket=bucket, Key="default", Body=PAYLOAD)
@@ -204,7 +211,7 @@ def test_a_wrong_checksum_is_not_rejected(s3, bucket, endpoint, credentials):
     (presigned PUT, streaming trailer) the checksum is the only integrity check
     there is, and it is not being made.
 
-    FIXME: when the Phase 1 checksum matrix lands this becomes a test that the
+    FIXME(#38): when the Phase 1 checksum matrix lands this becomes a test that the
     server answers 400 InvalidRequest and stores nothing.
     """
     import http.client
@@ -251,7 +258,7 @@ def test_get_with_checksum_mode_enabled(s3, bucket):
     Asserted as "no checksum field of any kind" rather than "no CRC32", so that
     a Phase 1 implementation that returns a different algorithm still trips it.
 
-    FIXME: when the Phase 1 checksum matrix lands, this inverts to
+    FIXME(#38): when the Phase 1 checksum matrix lands, this inverts to
     response["ChecksumCRC32"] == crc32_b64(PAYLOAD).
     """
     s3.put_object(Bucket=bucket, Key="checked", Body=PAYLOAD)
@@ -266,7 +273,7 @@ def test_get_with_checksum_mode_enabled(s3, bucket):
 def test_head_with_checksum_mode_enabled(s3, bucket):
     """Same divergence on the HEAD path, which s3transfer uses to plan reads.
 
-    FIXME: Phase 1 checksum matrix, as above.
+    FIXME(#38): Phase 1 checksum matrix, as above.
     """
     s3.put_object(Bucket=bucket, Key="checked", Body=PAYLOAD)
 
@@ -307,13 +314,18 @@ def test_aws_chunked_trailer_upload_is_decoded(s3, bucket, wire):
     assert got["Body"].read() == PAYLOAD
 
 
-def test_aws_chunked_trailer_upload_of_a_large_body(s3, bucket):
+def test_aws_chunked_trailer_upload_of_a_large_body(s3, bucket, wire):
     """The same path with a body botocore splits into several chunks.
 
     AwsChunkedWrapper reads in 8 KiB chunks, so a megabyte is a hundred and
     twenty-eight of them plus the terminating zero chunk and the trailer. A
     decoder that handled one chunk and mishandled the boundary between two
     would pass the test above and fail this one.
+
+    It carries the same four wire assertions as its sibling for the same
+    reason: without them, a `force_trailer_checksum` that had quietly stopped
+    flipping anything would leave this passing as an ordinary header-form PUT,
+    which is a test that proves nothing while looking green.
     """
     import os
 
@@ -324,9 +336,87 @@ def test_aws_chunked_trailer_upload_of_a_large_body(s3, bucket):
     finally:
         undo()
 
+    assert wire["headers"]["content-encoding"] == "aws-chunked"
+    assert wire["headers"]["transfer-encoding"] == "chunked"
+    assert wire["headers"]["x-amz-trailer"] == "x-amz-checksum-crc32"
+    assert wire["headers"]["x-amz-content-sha256"] == "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
+
     got = s3.get_object(Bucket=bucket, Key="trailered-large")
     assert got["ContentLength"] == len(payload)
     assert got["Body"].read() == payload
+
+
+def test_a_wrong_trailer_checksum_is_not_rejected(s3, bucket, endpoint, credentials):
+    """DIVERGENCE FROM AWS, and the one with no second line of defence.
+
+    The header-form counterpart above is softened by SigV4 payload signing: a
+    body corrupted in transit fails the signature there whether or not the
+    checksum is checked. This path has no such cover. `x-amz-content-sha256:
+    STREAMING-UNSIGNED-PAYLOAD-TRAILER` means exactly what it says - the seed
+    signature covers the headers and not the body - and AWS relies on the
+    trailing checksum as the body's integrity check. aks3 decodes the framing
+    correctly and then does not check the trailer, so on the path a default
+    boto3 takes over HTTPS there is currently no body-integrity check at all.
+
+    Hand-built for the same reason as the header case: boto3 computes the
+    trailer itself and will not lie in it. `payload()` is overridden rather than
+    the header being set after signing, because the sentinel has to be the value
+    the canonical request was built from or the signature would not verify.
+
+    In a real deployment TLS covers the wire, so this is not a remotely
+    exploitable substitution. What it means is that TLS is doing all of the
+    integrity work and S3's own end-to-end mechanism none of it.
+
+    FIXME(#38): when the Phase 1 checksum matrix lands this becomes a test that
+    the server answers 400 and stores nothing.
+    """
+    import http.client
+    import urllib.parse
+
+    access_key, secret_key = credentials
+    key = "wrong-trailer-checksum"
+    lie = crc32_b64(b"not this body at all")
+    framed = (
+        b"%x\r\n" % len(PAYLOAD)
+        + PAYLOAD
+        + b"\r\n0\r\n"
+        + f"x-amz-checksum-crc32:{lie}\r\n\r\n".encode()
+    )
+
+    class StreamingTrailer(botocore.auth.S3SigV4Auth):
+        def payload(self, request):
+            return "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
+
+    request = botocore.awsrequest.AWSRequest(
+        method="PUT",
+        url=f"{endpoint}/{bucket}/{key}",
+        data=framed,
+        headers={
+            "Content-Encoding": "aws-chunked",
+            "X-Amz-Trailer": "x-amz-checksum-crc32",
+            "X-Amz-Decoded-Content-Length": str(len(PAYLOAD)),
+            "Content-Length": str(len(framed)),
+        },
+    )
+    StreamingTrailer(
+        Credentials(access_key, secret_key), "s3", "us-east-1"
+    ).add_auth(request)
+    prepared = request.prepare()
+
+    parsed = urllib.parse.urlparse(prepared.url)
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=30)
+    connection.request("PUT", parsed.path, body=framed, headers=dict(prepared.headers))
+    response = connection.getresponse()
+    body = response.read()
+    connection.close()
+
+    assert response.status == 200, body
+    # The framing was decoded, so this really did take the trailer path and the
+    # object is the body rather than the chunk envelope. It is stored under a
+    # checksum describing something else entirely.
+    stored = s3.get_object(Bucket=bucket, Key=key)
+    assert stored["ContentLength"] == len(PAYLOAD)
+    assert stored["Body"].read() == PAYLOAD
 
 
 def test_checksum_calculation_can_be_turned_off(client_factory, bucket):
