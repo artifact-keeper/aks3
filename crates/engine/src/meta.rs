@@ -385,3 +385,160 @@ mod tests {
         assert!(!p.exists(), "manifest published despite the error");
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    //! Manifest invariants over arbitrary operation sequences.
+    //!
+    //! The examples above pin the three cases that were reasoned about while
+    //! writing `upsert`. These say the invariants hold whatever order the
+    //! operations arrive in, which is what a key being written, overwritten,
+    //! versioned and deleted in some interleaving actually produces.
+    //!
+    //! A failure prints its minimal input together with a `cc <seed>` line for
+    //! `crates/engine/proptest-regressions/meta.txt`; see the README there.
+
+    use std::collections::BTreeSet;
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// One step of a manifest's life.
+    #[derive(Debug, Clone)]
+    enum Op {
+        /// A `PUT`: the entry becomes the current version.
+        Upsert(String, String),
+        /// A `DELETE` naming a version.
+        Remove(String),
+    }
+
+    /// A small id alphabet on purpose: sequences only get interesting where ids
+    /// repeat, and repeats are what distinguish an upsert from an insert.
+    /// [`NULL_VERSION_ID`] is in it because the unversioned case is the one
+    /// that must never grow history.
+    fn version_id() -> impl Strategy<Value = String> {
+        prop::sample::select(vec![NULL_VERSION_ID, "v1", "v2", "v3"])
+            .prop_map(std::borrow::ToOwned::to_owned)
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            3 => (version_id(), "[0-9a-f]{4}").prop_map(|(id, etag)| Op::Upsert(id, etag)),
+            1 => version_id().prop_map(Op::Remove),
+        ]
+    }
+
+    fn entry(version_id: &str, etag: &str) -> VersionEntry {
+        VersionEntry {
+            version_id: version_id.to_owned(),
+            etag: etag.to_owned(),
+            size: 1,
+            content_type: "application/octet-stream".to_owned(),
+            user_metadata: BTreeMap::new(),
+            mtime_epoch_ms: 0,
+            delete_marker: false,
+        }
+    }
+
+    /// Manifests carrying the awkward halves of every field: hostile strings,
+    /// extreme numbers, tombstones, user metadata.
+    fn arbitrary_manifest() -> impl Strategy<Value = VersionManifest> {
+        let text = prop_oneof![
+            2 => "[ -~]{0,8}",
+            1 => any::<String>(),
+        ];
+        let entry = (
+            any::<String>(),
+            "[0-9a-f]{32}",
+            any::<u64>(),
+            text.clone(),
+            prop::collection::btree_map(text.clone(), text, 0..3),
+            any::<u64>(),
+            any::<bool>(),
+        )
+            .prop_map(|(version_id, etag, size, ctype, meta, mtime, marker)| {
+                VersionEntry {
+                    version_id,
+                    etag,
+                    size,
+                    content_type: ctype,
+                    user_metadata: meta,
+                    mtime_epoch_ms: mtime,
+                    delete_marker: marker,
+                }
+            });
+        (0_u32..=MANIFEST_FORMAT, prop::collection::vec(entry, 0..4))
+            .prop_map(|(format, versions)| VersionManifest { format, versions })
+    }
+
+    proptest! {
+        /// Whatever sequence of writes and deletes a key sees, the manifest
+        /// keeps its promises: the entry just written is the one an unqualified
+        /// read resolves to, an id appears at most once, an overwrite does not
+        /// grow history, and removing an id that is not there changes nothing.
+        #[test]
+        fn a_manifest_holds_its_invariants_through_any_sequence(
+            ops in prop::collection::vec(op(), 0..24),
+        ) {
+            let mut m = VersionManifest { format: MANIFEST_FORMAT, versions: vec![] };
+            // The model is just the ids, newest first, which is all the
+            // ordering a manifest promises.
+            let mut model: Vec<String> = Vec::new();
+
+            for step in ops {
+                let before = m.versions.len();
+                match step {
+                    Op::Upsert(id, etag) => {
+                        let known = model.contains(&id);
+                        m.upsert(entry(&id, &etag));
+                        model.retain(|v| v != &id);
+                        model.insert(0, id.clone());
+
+                        let head = m.latest().expect("a manifest with an entry has a head");
+                        prop_assert_eq!(&head.version_id, &id, "the upserted entry is not the head");
+                        prop_assert_eq!(&head.etag, &etag, "the head is a stale copy of {:?}", id);
+                        if known {
+                            prop_assert_eq!(m.versions.len(), before, "an overwrite grew history");
+                        } else {
+                            prop_assert_eq!(m.versions.len(), before + 1);
+                        }
+                    }
+                    Op::Remove(id) => {
+                        let known = model.contains(&id);
+                        if let Some(removed) = m.remove(&id) {
+                            prop_assert!(known, "removed {:?}, which was not there", id);
+                            prop_assert_eq!(removed.version_id, id.clone());
+                            prop_assert_eq!(m.versions.len(), before - 1);
+                            model.retain(|v| v != &id);
+                        } else {
+                            prop_assert!(!known, "did not remove {:?}, which was there", id);
+                            prop_assert_eq!(
+                                m.versions.len(),
+                                before,
+                                "removing an absent id changed the manifest"
+                            );
+                        }
+                    }
+                }
+
+                let ids: Vec<&str> = m.versions.iter().map(|e| e.version_id.as_str()).collect();
+                let unique: BTreeSet<&str> = ids.iter().copied().collect();
+                prop_assert_eq!(unique.len(), ids.len(), "duplicate version ids in {:?}", ids);
+                let want: Vec<&str> = model.iter().map(String::as_str).collect();
+                prop_assert_eq!(&ids, &want);
+            }
+        }
+
+        /// A manifest reaches disk as JSON, so anything it can hold has to
+        /// survive that trip unchanged: a field that serialized lossily would
+        /// lose object metadata on the next read.
+        #[test]
+        fn a_manifest_survives_the_json_it_is_stored_as(m in arbitrary_manifest()) {
+            let json = serde_json::to_vec(&m).expect("a manifest serializes");
+            let back: VersionManifest =
+                serde_json::from_slice(&json).expect("a manifest we wrote parses");
+            prop_assert_eq!(back, m);
+        }
+    }
+}
