@@ -5,6 +5,10 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # Roughly ten times what this job costs cold. Not a budget, a stop: the
+    # crash harness waits on events with generous deadlines, and a wait that
+    # never ends would otherwise sit on a runner for six hours.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       # Same version as rust-toolchain.toml, which is what cargo obeys inside
@@ -34,9 +38,17 @@ jobs:
       # AKS3_ENOSPC_REQUIRED turns the leg's skip into a failure. The mount
       # exists by the time this runs, so a skip here means the wiring broke, and
       # a skipped leg that passes looks exactly like a leg that ran.
+      # AKS3_CRASH_ITERATIONS is pinned here for the same reason as
+      # PROPTEST_CASES: what CI covers should be a number in this file rather
+      # than whatever default happens to suit a laptop. Four times the local
+      # default of ten, which is about five hundred and twenty crashes for
+      # roughly four seconds on a Linux runner. The number that matters is the
+      # nightly's seventy-five; this one only has to be more of a sample than
+      # the default without being felt on the pull-request path.
       - run: cargo test --workspace
         env:
           PROPTEST_CASES: "1024"
+          AKS3_CRASH_ITERATIONS: "40"
           AKS3_ENOSPC_DIR: /mnt/aks3-enospc
           AKS3_ENOSPC_REQUIRED: "1"
       # Before the teardown, because the crash harness archives the post-crash
@@ -60,6 +72,9 @@ jobs:
   # fails here rather than in whatever client hits it first.
   compliance:
     runs-on: ubuntu-latest
+    # Same reasoning as the check job's: this one spawns a server and waits on
+    # a suite, and neither wait is bounded from inside.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
