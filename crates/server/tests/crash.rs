@@ -2,7 +2,8 @@
 // Copyright (C) 2026 aks3 contributors
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Crash recovery: what the store looks like after the writer is killed outright.
+//! Crash recovery: what the store looks like after the writer is stopped
+//! outright, by a `SIGKILL` or by the disk running out from under it.
 //!
 //! # What a `SIGKILL` proves here, and what it does not
 //!
@@ -20,7 +21,7 @@
 //! needs a filesystem that can be told to forget writes that were never synced
 //! (`LazyFS`), which is a separate, nightly job.
 //!
-//! # Two roles, one harness
+//! # Three legs, one harness
 //!
 //! 1. **The engine-precision loop** ([`engine_crash_loop`]) works against
 //!    [`FsEngine`] directly, so a failure names an engine invariant rather than
@@ -31,6 +32,12 @@
 //!    per test run through the real `aks3` binary and the real AWS SDK, which is
 //!    what checks that the server's own restart path over a crashed data
 //!    directory works at all.
+//! 3. **The disk-full leg** ([`disk_full_store_survives_and_recovers`]) stops
+//!    the writer a different way: it fills the filesystem instead of killing the
+//!    process. Everything above asks what survives an interrupted write, and
+//!    this asks the same question of the one interruption the engine has to
+//!    report rather than merely survive. It shares this file's machinery, and
+//!    the section at the bottom explains what it needs from its environment.
 //!
 //! # The child process
 //!
@@ -86,6 +93,7 @@ use std::fmt::Write as _;
 use std::hash::{BuildHasher as _, RandomState};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::SocketAddr;
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -569,9 +577,9 @@ struct Expectation<'a> {
 }
 
 /// Read a whole object back through the engine's own `GET` path.
-async fn read_object(engine: &FsEngine, key: &str) -> Result<Vec<u8>, String> {
+async fn read_object(engine: &FsEngine, bucket: &str, key: &str) -> Result<Vec<u8>, String> {
     let (_, _, _, mut body) = engine
-        .get_object(BUCKET, key, None)
+        .get_object(bucket, key, None)
         .await
         .map_err(|e| format!("GET {key}: {e}"))?;
     let mut out = Vec::new();
@@ -697,7 +705,7 @@ async fn check_all_or_nothing(
                 want.len()
             ));
         }
-        let got = read_object(engine, key).await?;
+        let got = read_object(engine, BUCKET, key).await?;
         if got != want {
             return Err(format!("{key}: {} bytes read back do not match", got.len()));
         }
@@ -1229,4 +1237,736 @@ async fn still_serving(c: &aws_sdk_s3::Client, scratch: &Path, seed: u64) {
     if fresh[..] != body[..] {
         fail_e2e(scratch, seed, "the recovered store lost a fresh write");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The disk-full leg
+// ---------------------------------------------------------------------------
+//
+// A `SIGKILL` takes the writer away between two syscalls. A full disk stops it
+// inside one, and unlike a kill it is a failure the engine has to *report*:
+// there is a caller waiting for an answer, and what that answer is, and what
+// the store looks like when it arrives, is the whole of this leg.
+//
+// # Why it needs a filesystem of its own
+//
+// The only way to see what a store does when the disk fills is to fill one, and
+// no test may do that to the filesystem the checkout is on. So the leg runs
+// against a small filesystem named by [`ENOSPC_DIR_VAR`], which
+// `tests/enospc/setup-loopback.sh` mounts and the Linux CI job sets; with the
+// variable unset the leg prints why it is skipping and returns. That keeps
+// `cargo test --workspace` the single local gate and keeps it runnable without
+// sudo, at the cost of a leg that is enforced in CI rather than on every
+// developer's laptop. Filling a mounted filesystem is not something a test
+// process can arrange for itself: `mount(8)` wants root, and a test that wants
+// root is a test nobody runs.
+//
+// Two guards stand between a mistyped variable and somebody's data: the leg
+// refuses a directory that is not itself a mount point, before it removes
+// anything, and it refuses to write more than [`BALLAST_LIMIT`] without the
+// filesystem filling up.
+//
+// # How it fills, and why it does it twice
+//
+// Filling the filesystem an object at a time would cost whatever its size is,
+// which is a number chosen in a shell script rather than here. Instead a ballast
+// file takes the free space in one go and then hands [`ENOSPC_MARGIN`] of it
+// back, so the store starts with the same small amount of room whatever it is
+// mounted on and the leg's cost stays the same with it.
+//
+// Then two fill phases. The first writes [`ENOSPC_BODY`]-sized objects in
+// [`ENOSPC_CHUNK`] chunks, so the refusal lands part way through a body that
+// was already being staged, which is the streaming case a client produces. The
+// second continues with [`ENOSPC_SMALL`] objects until one of those is refused
+// too. The second phase is what makes the recovery assertion mean anything:
+// after it, the space a `PUT` of that size needs is space the filesystem does
+// not have, so when the same `PUT` succeeds after a `DELETE`, the `DELETE` is
+// the reason. Without it the leg would prove only that a small object fits in
+// the room a large one could not use.
+
+/// Names a directory on a small filesystem the leg is allowed to fill.
+const ENOSPC_DIR_VAR: &str = "AKS3_ENOSPC_DIR";
+/// Set where the leg is expected to run, so that skipping is a failure.
+///
+/// A leg that skips prints a line and passes, which is indistinguishable from a
+/// leg that ran unless somebody reads the log. CI knows it mounted a filesystem,
+/// so CI is where that ambiguity can be closed: with this set, the skip path
+/// panics instead of returning. It is the difference between a gate and a gate
+/// that quietly stopped being one.
+const ENOSPC_REQUIRED_VAR: &str = "AKS3_ENOSPC_REQUIRED";
+/// The bucket the disk-full leg writes to.
+const ENOSPC_BUCKET: &str = "diskfull";
+/// Free space the ballast leaves for the store, and the chunk it is written in.
+const ENOSPC_MARGIN: u64 = 2 * 1024 * 1024;
+const BALLAST_CHUNK: usize = 1024 * 1024;
+/// Written without the filesystem filling up, this is not a small filesystem
+/// and the leg stops rather than keep going on whatever it was pointed at.
+const BALLAST_LIMIT: u64 = 256 * 1024 * 1024;
+/// Body sizes for the two fill phases, and the chunk a body arrives in.
+const ENOSPC_BODY: usize = 128 * 1024;
+const ENOSPC_SMALL: usize = 4 * 1024;
+const ENOSPC_CHUNK: usize = 16 * 1024;
+/// Enough `PUT`s to fill [`ENOSPC_MARGIN`] several times over. Reaching it means
+/// the filesystem is not filling, which is a failure rather than a longer run.
+const ENOSPC_MAX_PUTS: usize = 2048;
+/// Objects deleted to make room again. More than one, so the room recovered is
+/// unambiguously more than the failed `PUT` released when its staged file went.
+const ENOSPC_FREED: usize = 3;
+
+/// The key at `index` in the disk-full leg. Two directory levels, as
+/// [`key_for`] has, so a first write under a key creates a chain.
+fn enospc_key(index: usize) -> String {
+    format!("full/{index:04}/object-{index}")
+}
+
+/// The small filesystem to fill, or [`None`] with a printed reason.
+///
+/// A variable that is set but wrong is a mistake to report, not a reason to
+/// skip: it means somebody meant to run this leg and it did not run.
+fn enospc_mount() -> Option<PathBuf> {
+    let Ok(dir) = std::env::var(ENOSPC_DIR_VAR) else {
+        let why = format!(
+            "{ENOSPC_DIR_VAR} is unset. It names a small filesystem this leg may fill \
+             completely; tests/enospc/setup-loopback.sh mounts one on Linux (it needs \
+             sudo, so cargo cannot do it), and the Linux CI job sets the variable. This \
+             host is {}.",
+            std::env::consts::OS
+        );
+        assert!(
+            std::env::var_os(ENOSPC_REQUIRED_VAR).is_none(),
+            "{ENOSPC_REQUIRED_VAR} is set, so skipping the disk-full leg is a failure: {why}"
+        );
+        println!("disk-full leg skipped: {why}");
+        return None;
+    };
+    let dir =
+        std::fs::canonicalize(&dir).unwrap_or_else(|e| panic!("{ENOSPC_DIR_VAR} names {dir}: {e}"));
+    let meta = std::fs::metadata(&dir)
+        .unwrap_or_else(|e| panic!("{ENOSPC_DIR_VAR} names {}: {e}", dir.display()));
+    assert!(
+        meta.is_dir(),
+        "{ENOSPC_DIR_VAR} names {}, which is not a directory",
+        dir.display()
+    );
+    // The leg deletes what it finds under this directory and then fills the
+    // filesystem it is on, so being given the wrong thing has to be impossible
+    // rather than unlikely, and it has to be impossible *before* the first
+    // removal rather than by the time the ballast has written 256 MiB.
+    //
+    // The check is that the directory is itself a mount point, which is what a
+    // filesystem mounted for this leg always is: a mount point is the one place
+    // where a directory's device differs from its parent's. Naming a directory
+    // *inside* some other mount, or any directory on the root filesystem, or `/`
+    // itself, all fail it.
+    let parent = dir.parent().unwrap_or_else(|| {
+        panic!(
+            "{ENOSPC_DIR_VAR} names {}, which has no parent and so \
+             cannot be a mount point of its own",
+            dir.display()
+        )
+    });
+    let parent_meta =
+        std::fs::metadata(parent).unwrap_or_else(|e| panic!("{}: {e}", parent.display()));
+    assert_ne!(
+        meta.dev(),
+        parent_meta.dev(),
+        "{ENOSPC_DIR_VAR} names {}, which is not a mount point: it is on the same \
+         filesystem as its parent {}. This leg deletes what it finds there and then fills \
+         the filesystem; point it at a mount of its own, as \
+         tests/enospc/setup-loopback.sh makes.",
+        dir.display(),
+        parent.display()
+    );
+    Some(dir)
+}
+
+/// Take the filesystem's free space with a ballast file, then hand `margin` of
+/// it back. Returns the size the ballast was left at.
+///
+/// Truncating is what returns the space: `ftruncate` releases the blocks past
+/// the new length there and then, so what is free afterwards is `margin` and
+/// not whatever the filesystem happened to have.
+fn fill_to_margin(path: &Path, margin: u64) -> Result<u64, String> {
+    let mut ballast =
+        std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let chunk = vec![0_u8; BALLAST_CHUNK];
+    loop {
+        match ballast.write_all(&chunk) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::StorageFull => break,
+            Err(e) => return Err(format!("writing the ballast: {e}")),
+        }
+        let len = ballast
+            .metadata()
+            .map_err(|e| format!("sizing the ballast: {e}"))?
+            .len();
+        if len > BALLAST_LIMIT {
+            return Err(format!(
+                "wrote {len} bytes to {} without filling the filesystem; {ENOSPC_DIR_VAR} \
+                 must name a small one",
+                path.display()
+            ));
+        }
+    }
+    let len = ballast
+        .metadata()
+        .map_err(|e| format!("sizing the ballast: {e}"))?
+        .len();
+    if len < margin * 2 {
+        return Err(format!(
+            "the filesystem held only {len} bytes, too small to leave a {margin}-byte margin"
+        ));
+    }
+    let keep = len - margin;
+    ballast
+        .set_len(keep)
+        .map_err(|e| format!("truncating the ballast: {e}"))?;
+    Ok(keep)
+}
+
+/// Put the small filesystem back the way it was found.
+fn clear_small_fs(store: &Path, ballast: &Path) {
+    // The ballast first: without the space it holds, removing the store is
+    // itself work the filesystem may not have room for.
+    let _ = std::fs::remove_file(ballast);
+    let _ = std::fs::remove_dir_all(store);
+}
+
+/// Archive the store and fail, having first made room for the archive's note.
+///
+/// [`fail`] records what went wrong inside the directory it is about to
+/// archive, and this leg's whole business is that the filesystem that directory
+/// is on has no room left. Dropping the ballast gives it room. The store is the
+/// evidence and is not touched.
+fn fail_enospc(store: &Path, ballast: &Path, seed: u64, leg: &str, problem: &str) -> ! {
+    let _ = std::fs::remove_file(ballast);
+    fail(
+        store,
+        &format!("enospc-{leg}-{seed}"),
+        &format!("{SEED_VAR}={seed}, with {ENOSPC_DIR_VAR} set to a small filesystem"),
+        &format!("disk-full {leg} leg: {problem}"),
+    )
+}
+
+/// The names left in the store's staging directory.
+///
+/// Empty is the assertion everywhere it is used: a `PUT` that failed on a full
+/// disk has to take its staged file with it, whether it failed while writing
+/// the body or inside `commit`, because nothing sweeps that directory again
+/// until the next restart and a store that leaks there loses space it will
+/// never get back.
+fn staged_files(store: &Path) -> Result<Vec<String>, String> {
+    let tmp = store.join(".aks3").join("tmp");
+    let entries = std::fs::read_dir(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", tmp.display()))?;
+        names.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    Ok(names)
+}
+
+/// A body of `len` bytes derived from `key`, arriving in [`ENOSPC_CHUNK`] pieces.
+fn chunked_body(key: &str, seed: u64, len: usize) -> aks3_engine::BoxByteStream {
+    let body = content_for(key, seed, len);
+    let chunks: Vec<bytes::Bytes> = body
+        .chunks(ENOSPC_CHUNK)
+        .map(bytes::Bytes::copy_from_slice)
+        .collect();
+    Box::pin(futures::stream::iter(
+        chunks.into_iter().map(Ok::<_, std::io::Error>),
+    ))
+}
+
+/// Write `body_len`-sized objects from `next` on until the filesystem refuses
+/// one, returning the index that was refused and what the engine said.
+async fn put_until_refused(
+    engine: &FsEngine,
+    seed: u64,
+    next: &mut usize,
+    body_len: usize,
+    stored: &mut Vec<usize>,
+) -> Result<(usize, EngineError), String> {
+    while *next < ENOSPC_MAX_PUTS {
+        let index = *next;
+        *next += 1;
+        let key = enospc_key(index);
+        let put = engine
+            .put_object(
+                ENOSPC_BUCKET,
+                &key,
+                chunked_body(&key, seed, body_len),
+                PutOpts::default(),
+            )
+            .await;
+        match put {
+            Ok(_) => stored.push(index),
+            Err(e) => return Ok((index, e)),
+        }
+    }
+    Err(format!(
+        "{ENOSPC_MAX_PUTS} PUTs did not fill the filesystem"
+    ))
+}
+
+/// A full disk reaches the caller as [`EngineError::Io`] carrying `ENOSPC`.
+///
+/// Pinned, not endorsed. The engine has no disk-full variant, so the condition
+/// arrives in the catch-all one and the API layer turns that into a bare 500
+/// (see [`check_refusal`]). The taxonomy that would let a client tell "this
+/// server is out of space, back off" from "this server has a bug" is issue #29,
+/// and this assertion is what makes changing the class a deliberate edit here
+/// rather than a silent one there.
+fn check_enospc_class(what: &str, err: &EngineError) -> Result<(), String> {
+    match err {
+        EngineError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull => Ok(()),
+        EngineError::Io(io) => Err(format!(
+            "{what} failed with an i/o error that is not ENOSPC: {io} (kind {:?}, raw {:?})",
+            io.kind(),
+            io.raw_os_error()
+        )),
+        other => Err(format!(
+            "{what} failed with {other:?}, not an EngineError::Io carrying ENOSPC"
+        )),
+    }
+}
+
+/// No manifest may name bytes that are not there, or record a size the data file
+/// does not have, and every manifest must parse.
+///
+/// `allowed` bounds the data files no manifest names. That is one per refused
+/// `PUT`: a `PUT` commits its data before the manifest naming it, so running out
+/// of space between the two leaves the data behind unnamed.
+async fn check_no_torn_state(objects: &Path, allowed: usize) -> Result<(), String> {
+    let found = collect_keys(objects).await?;
+    let orphans = check_manifests(&found)?;
+    if orphans > allowed {
+        return Err(format!(
+            "{orphans} data files no manifest names, at most one per refused PUT expected \
+             ({allowed})"
+        ));
+    }
+    Ok(())
+}
+
+/// Nothing the engine reported stored may be missing, short or unreadable.
+async fn check_stored_intact(
+    engine: &FsEngine,
+    seed: u64,
+    stored: &[usize],
+    body_len: usize,
+) -> Result<(), String> {
+    for &index in stored {
+        let key = enospc_key(index);
+        let got = read_object(engine, ENOSPC_BUCKET, &key).await?;
+        let want = content_for(&key, seed, body_len);
+        if got != want {
+            return Err(format!(
+                "{key}: stored before the filesystem filled, reads back {} of {} bytes \
+                 or the wrong ones",
+                got.len(),
+                want.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The engine leg: fill the filesystem through [`FsEngine`], then check what is
+/// left and that a `DELETE` gets the store working again.
+async fn engine_disk_full(store: &Path, ballast: &Path, seed: u64) -> Result<(), String> {
+    std::fs::create_dir_all(store).map_err(|e| format!("{}: {e}", store.display()))?;
+    let engine = FsEngine::open(store)
+        .await
+        .map_err(|e| format!("opening the data directory: {e}"))?;
+    engine
+        .create_bucket(ENOSPC_BUCKET)
+        .await
+        .map_err(|e| format!("creating the bucket: {e}"))?;
+
+    let ballast_len = fill_to_margin(ballast, ENOSPC_MARGIN)?;
+    println!("disk-full engine leg: ballast {ballast_len} bytes, {ENOSPC_MARGIN} left free");
+
+    let mut next = 0;
+    let mut stored = Vec::new();
+    let (big_index, big_err) =
+        put_until_refused(&engine, seed, &mut next, ENOSPC_BODY, &mut stored).await?;
+    let big_stored = stored.len();
+    let (small_index, small_err) =
+        put_until_refused(&engine, seed, &mut next, ENOSPC_SMALL, &mut stored).await?;
+    println!(
+        "disk-full engine leg: {big_stored} objects of {ENOSPC_BODY} bytes then \
+         {} of {ENOSPC_SMALL}, refused at {big_index} and {small_index}",
+        stored.len() - big_stored
+    );
+
+    check_enospc_class(&format!("a {ENOSPC_BODY}-byte PUT"), &big_err)?;
+    check_enospc_class(&format!("a {ENOSPC_SMALL}-byte PUT"), &small_err)?;
+    if stored.len() < ENOSPC_FREED + 1 {
+        return Err(format!(
+            "only {} objects were stored before the filesystem filled, too few to delete \
+             {ENOSPC_FREED} of them; ENOSPC_MARGIN is too small",
+            stored.len()
+        ));
+    }
+
+    let staged = staged_files(store)?;
+    if !staged.is_empty() {
+        return Err(format!(
+            "the refused PUTs left {} file(s) in .aks3/tmp: {staged:?}",
+            staged.len()
+        ));
+    }
+
+    // A refused PUT is refused entirely. The data file is committed before the
+    // manifest naming it, so a PUT that ran out of space either never got that
+    // far or left a data file no manifest names, and in neither case is there a
+    // version to read.
+    for index in [big_index, small_index] {
+        let key = enospc_key(index);
+        match engine.head_object(ENOSPC_BUCKET, &key).await {
+            Err(EngineError::NoSuchKey) => {}
+            Ok(_) => return Err(format!("{key}: the PUT was refused, the object is there")),
+            Err(e) => return Err(format!("{key}: the PUT was refused, HEAD failed with {e}")),
+        }
+    }
+
+    // Nothing torn: every manifest parses, and none of them names bytes that are
+    // absent or the wrong length. One data file no manifest names is allowed per
+    // refused PUT, since a PUT can be refused between committing its data and
+    // storing the manifest, and there are three refusals in this leg.
+    let objects = store.join("buckets").join(ENOSPC_BUCKET).join("objects");
+    check_no_torn_state(&objects, 2).await?;
+    check_stored_intact(&engine, seed, &stored[..big_stored], ENOSPC_BODY).await?;
+    check_stored_intact(&engine, seed, &stored[big_stored..], ENOSPC_SMALL).await?;
+
+    // The last thing before the deletes is a refusal, so that the first thing
+    // after them proves something. Without this the recovery below rests on
+    // arithmetic: the refused PUT above released its staged blocks when it was
+    // dropped, and whether that was enough for the next small PUT on its own is
+    // a question about block sizes rather than about DELETE. Asking the store
+    // directly settles it. Normally the very first attempt here is refused; if
+    // the returned blocks did stretch to one more object, that object is simply
+    // more fill and the loop refuses on the one after it. It cannot end any
+    // other way, since nothing in it frees anything.
+    let before_proof = stored.len();
+    let (_, proof_err) =
+        put_until_refused(&engine, seed, &mut next, ENOSPC_SMALL, &mut stored).await?;
+    check_enospc_class(
+        &format!("the {ENOSPC_SMALL}-byte PUT immediately before the DELETEs"),
+        &proof_err,
+    )?;
+    println!(
+        "disk-full engine leg: {} further PUTs fitted in what the refused PUT released",
+        stored.len() - before_proof
+    );
+
+    // The filesystem is now known to be too full for a PUT of this size. A
+    // delete has to work here or an operator whose disk filled has no way out
+    // that does not involve taking the store apart by hand. It can: Phase 0
+    // removes the manifest and then the data file and writes nothing, so it
+    // needs no space to succeed.
+    for &index in stored.iter().take(ENOSPC_FREED) {
+        let key = enospc_key(index);
+        engine
+            .delete_object(ENOSPC_BUCKET, &key)
+            .await
+            .map_err(|e| format!("{key}: DELETE on a full filesystem failed with {e}"))?;
+        match engine.head_object(ENOSPC_BUCKET, &key).await {
+            Err(EngineError::NoSuchKey) => {}
+            Ok(_) => return Err(format!("{key}: deleted, still readable")),
+            Err(e) => return Err(format!("{key}: deleted, HEAD failed with {e}")),
+        }
+    }
+
+    // And the space those deletes returned is usable: a PUT of exactly the size
+    // that was refused before them now succeeds and reads back whole.
+    let key = enospc_key(next);
+    engine
+        .put_object(
+            ENOSPC_BUCKET,
+            &key,
+            chunked_body(&key, seed, ENOSPC_SMALL),
+            PutOpts::default(),
+        )
+        .await
+        .map_err(|e| format!("{key}: PUT after {ENOSPC_FREED} deletes failed with {e}"))?;
+    check_stored_intact(&engine, seed, &[next], ENOSPC_SMALL).await?;
+
+    // The end state, not just the state at the moment of the refusals: three
+    // refused PUTs and three deletes later, nothing names bytes that are not
+    // there and nothing is staged.
+    check_no_torn_state(&objects, 3).await?;
+    let staged = staged_files(store)?;
+    if !staged.is_empty() {
+        return Err(format!("the recovered store left {staged:?} in .aks3/tmp"));
+    }
+    Ok(())
+}
+
+/// What a refused HTTP `PUT` came back as, and which key it was for.
+struct Refusal {
+    index: usize,
+    status: Option<u16>,
+    code: Option<String>,
+    detail: String,
+}
+
+/// Write `body_len`-sized objects from `next` on through the real server until
+/// one is refused, returning what the client saw.
+async fn http_put_until_refused(
+    c: &aws_sdk_s3::Client,
+    seed: u64,
+    next: &mut usize,
+    body_len: usize,
+    stored: &mut Vec<usize>,
+) -> Result<Refusal, String> {
+    use aws_sdk_s3::error::ProvideErrorMetadata as _;
+
+    while *next < ENOSPC_MAX_PUTS {
+        let index = *next;
+        *next += 1;
+        let key = enospc_key(index);
+        let body = content_for(&key, seed, body_len);
+        let sent = c
+            .put_object()
+            .bucket(ENOSPC_BUCKET)
+            .key(&key)
+            .body(body.into())
+            .send()
+            .await;
+        match sent {
+            Ok(_) => stored.push(index),
+            Err(e) => {
+                return Ok(Refusal {
+                    index,
+                    status: e.raw_response().map(|r| r.status().as_u16()),
+                    code: e.code().map(str::to_owned),
+                    detail: format!("{e:?}"),
+                })
+            }
+        }
+    }
+    Err(format!(
+        "{ENOSPC_MAX_PUTS} PUTs did not fill the filesystem"
+    ))
+}
+
+/// A full disk reaches the client as a 500 `InternalError`.
+///
+/// Pinned, not endorsed, and the reason is one layer down: the engine reports
+/// `ENOSPC` in its catch-all [`EngineError::Io`] variant, and `map_engine_err`
+/// turns that into a bare `InternalError` so no host path can leak in the
+/// response. A client cannot tell a server that is out of space from one that is
+/// broken, and AWS itself would answer this class of condition with a
+/// retry-after-style 503 or a 507-ish "insufficient storage" rather than a 500.
+/// Fixing that means a disk-full variant in the engine's error taxonomy, which
+/// is issue #29 rather than something this test changes; what the test does is
+/// make the current answer a written-down one, so that issue edits this line
+/// deliberately.
+///
+/// One outcome is deliberately not allowed here: a dropped connection. Both body
+/// sizes this leg uses are small enough that the client finishes sending before
+/// the server answers, so the refusal comes back as a response rather than as a
+/// reset. If that ever stops holding, the fix is to decide which outcomes are
+/// the contract and assert exactly those, never to retry: a retry would hide the
+/// difference between "a full disk answers" and "a full disk hangs up", which is
+/// the difference a client's error handling is built on.
+fn check_refusal(what: &str, refusal: &Refusal) -> Result<(), String> {
+    if refusal.status != Some(500) || refusal.code.as_deref() != Some("InternalError") {
+        return Err(format!(
+            "{what} came back as status {:?} code {:?}, not the 500 InternalError this \
+             pins: {}",
+            refusal.status, refusal.code, refusal.detail
+        ));
+    }
+    Ok(())
+}
+
+/// The key must not be there, and the server must say so with a 404 rather than
+/// with anything else it might have to say about a full disk.
+async fn http_head_missing(c: &aws_sdk_s3::Client, what: &str, index: usize) -> Result<(), String> {
+    let key = enospc_key(index);
+    match c.head_object().bucket(ENOSPC_BUCKET).key(&key).send().await {
+        Ok(_) => Err(format!("{key}: {what}, HEAD answers with the object")),
+        Err(e) => {
+            let status = e.raw_response().map(|r| r.status().as_u16());
+            if status == Some(404) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{key}: {what}, HEAD came back {status:?} rather than 404: {e:?}"
+                ))
+            }
+        }
+    }
+}
+
+/// Read an object back through the real server and check its bytes.
+async fn http_read_back(
+    c: &aws_sdk_s3::Client,
+    seed: u64,
+    index: usize,
+    body_len: usize,
+) -> Result<(), String> {
+    let key = enospc_key(index);
+    let got = c
+        .get_object()
+        .bucket(ENOSPC_BUCKET)
+        .key(&key)
+        .send()
+        .await
+        .map_err(|e| format!("{key}: GET failed with {e:?}"))?;
+    let bytes = got
+        .body
+        .collect()
+        .await
+        .map_err(|e| format!("{key}: the body stopped arriving: {e}"))?
+        .into_bytes();
+    if bytes[..] != content_for(&key, seed, body_len)[..] {
+        return Err(format!(
+            "{key}: read back {} of {body_len} bytes, or the wrong ones",
+            bytes.len()
+        ));
+    }
+    Ok(())
+}
+
+/// The same thing through the real binary and the real AWS SDK: what a client
+/// sees when the server's disk fills, and that the server is still a server
+/// afterwards.
+async fn http_disk_full(store: &Path, ballast: &Path, seed: u64) -> Result<(), String> {
+    std::fs::create_dir_all(store).map_err(|e| format!("{}: {e}", store.display()))?;
+    let mut server = ServerProc::start(store);
+    let c = client(server.addr);
+    c.create_bucket()
+        .bucket(ENOSPC_BUCKET)
+        .send()
+        .await
+        .map_err(|e| format!("creating the bucket: {e:?}"))?;
+
+    let ballast_len = fill_to_margin(ballast, ENOSPC_MARGIN)?;
+    println!("disk-full http leg: ballast {ballast_len} bytes, {ENOSPC_MARGIN} left free");
+
+    let mut next = 0;
+    let mut stored = Vec::new();
+    let big = http_put_until_refused(&c, seed, &mut next, ENOSPC_BODY, &mut stored).await?;
+    let big_stored = stored.len();
+    let small = http_put_until_refused(&c, seed, &mut next, ENOSPC_SMALL, &mut stored).await?;
+    println!(
+        "disk-full http leg: {big_stored} objects of {ENOSPC_BODY} bytes then {} of \
+         {ENOSPC_SMALL}",
+        stored.len() - big_stored
+    );
+
+    check_refusal(&format!("a {ENOSPC_BODY}-byte PUT"), &big)?;
+    check_refusal(&format!("a {ENOSPC_SMALL}-byte PUT"), &small)?;
+    if stored.len() < ENOSPC_FREED + 1 {
+        return Err(format!(
+            "only {} objects were stored before the filesystem filled",
+            stored.len()
+        ));
+    }
+
+    let staged = staged_files(store)?;
+    if !staged.is_empty() {
+        return Err(format!(
+            "the refused PUTs left {} file(s) in .aks3/tmp: {staged:?}",
+            staged.len()
+        ));
+    }
+
+    // A 500 on the way in does not leave a key half there: the client that got
+    // one has to be able to conclude the object does not exist.
+    for refusal in [&big, &small] {
+        http_head_missing(&c, "the PUT came back 500", refusal.index).await?;
+    }
+
+    // Still a server, not just a process that is up: a read of something written
+    // before the disk filled has to answer with the bytes. A store that refuses
+    // reads once writes start failing is an outage rather than a full disk.
+    http_read_back(&c, seed, stored[0], ENOSPC_BODY).await?;
+
+    // As in the engine leg, the last thing before the deletes is a refusal, so
+    // that the recovery after them is attributable to the deletes rather than to
+    // whatever the earlier refused PUT released.
+    let proof = http_put_until_refused(&c, seed, &mut next, ENOSPC_SMALL, &mut stored).await?;
+    check_refusal(
+        &format!("the {ENOSPC_SMALL}-byte PUT immediately before the DELETEs"),
+        &proof,
+    )?;
+
+    for &index in stored.iter().take(ENOSPC_FREED) {
+        c.delete_object()
+            .bucket(ENOSPC_BUCKET)
+            .key(enospc_key(index))
+            .send()
+            .await
+            .map_err(|e| {
+                format!(
+                    "{}: DELETE on a full filesystem failed with {e:?}",
+                    enospc_key(index)
+                )
+            })?;
+        http_head_missing(&c, "the DELETE succeeded", index).await?;
+    }
+
+    let key = enospc_key(next);
+    c.put_object()
+        .bucket(ENOSPC_BUCKET)
+        .key(&key)
+        .body(content_for(&key, seed, ENOSPC_SMALL).into())
+        .send()
+        .await
+        .map_err(|e| format!("{key}: PUT after {ENOSPC_FREED} deletes failed with {e:?}"))?;
+    http_read_back(&c, seed, next, ENOSPC_SMALL).await?;
+
+    let staged = staged_files(store)?;
+    if !staged.is_empty() {
+        return Err(format!("the recovered store left {staged:?} in .aks3/tmp"));
+    }
+
+    server.proc.kill_9();
+    Ok(())
+}
+
+/// Fill a small filesystem underneath a store, twice: once through the engine
+/// and once through the whole server.
+///
+/// One test rather than two, because both legs fill the same filesystem and
+/// libtest runs tests in parallel: as separate tests they would take each
+/// other's space and neither would be measuring what it says it measures.
+/// Sequencing them here is cheaper and clearer than a lock they would both have
+/// to remember to take.
+#[test]
+fn disk_full_store_survives_and_recovers() {
+    let Some(mount) = enospc_mount() else {
+        return;
+    };
+    let seed = run_seed();
+    println!(
+        "disk-full leg: seed={seed}, filling {} ({SEED_VAR} to reproduce)",
+        mount.display()
+    );
+
+    let store = mount.join("store");
+    let ballast = mount.join("ballast.bin");
+    // Whatever a previous run left, including a run that failed and kept its
+    // evidence. This one needs the whole filesystem.
+    clear_small_fs(&store, &ballast);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a tokio runtime");
+
+    if let Err(problem) = runtime.block_on(engine_disk_full(&store, &ballast, seed)) {
+        fail_enospc(&store, &ballast, seed, "engine", &problem);
+    }
+    clear_small_fs(&store, &ballast);
+
+    if let Err(problem) = runtime.block_on(http_disk_full(&store, &ballast, seed)) {
+        fail_enospc(&store, &ballast, seed, "http", &problem);
+    }
+    clear_small_fs(&store, &ballast);
 }
