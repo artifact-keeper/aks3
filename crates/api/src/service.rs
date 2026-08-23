@@ -36,12 +36,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aks3_engine::{BoxByteStream, ByteRange, ListParams, ObjectInfo, ObjectLayer, PutOpts};
 use futures::{Stream, StreamExt as _, TryStreamExt as _};
 use s3s::dto::{
-    Bucket, CommonPrefix, ContentLength, CreateBucketInput, CreateBucketOutput, DeleteBucketInput,
-    DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput, ETag, GetObjectInput,
-    GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput, HeadObjectOutput,
-    KeyCount, ListBucketsInput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output,
-    MaxKeys, Object, Owner, PutObjectInput, PutObjectOutput, Range as DtoRange, StreamingBlob,
-    Timestamp,
+    Bucket, ChecksumMode, CommonPrefix, ContentLength, CreateBucketInput, CreateBucketOutput,
+    DeleteBucketInput, DeleteBucketOutput, DeleteObjectInput, DeleteObjectOutput, ETag,
+    GetObjectInput, GetObjectOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
+    HeadObjectOutput, KeyCount, ListBucketsInput, ListBucketsOutput, ListObjectsV2Input,
+    ListObjectsV2Output, MaxKeys, Object, Owner, PutObjectInput, PutObjectOutput,
+    Range as DtoRange, StreamingBlob, Timestamp,
 };
 use s3s::header::{CONTENT_ENCODING, X_AMZ_CONTENT_SHA256, X_AMZ_DECODED_CONTENT_LENGTH};
 use s3s::{s3_error, S3Request, S3Response, S3Result};
@@ -139,6 +139,15 @@ fn page_size(requested: Option<MaxKeys>) -> MaxKeys {
 /// was could not be stored. It is here so the conversion is total.
 fn wire_length(len: u64) -> ContentLength {
     ContentLength::try_from(len).unwrap_or(ContentLength::MAX)
+}
+
+/// Whether a read asked for its stored checksum with `ChecksumMode=ENABLED`.
+///
+/// The comparison ignores case: the value arrives from a header, and the only
+/// value S3 defines is `ENABLED`. Any other value, or none, means the client did
+/// not ask, and the checksum is left off the response.
+fn checksum_mode_enabled(mode: Option<&ChecksumMode>) -> bool {
+    mode.is_some_and(|m| m.as_str().eq_ignore_ascii_case(ChecksumMode::ENABLED))
 }
 
 /// An engine body stream, made `Sync` so `s3s` can carry it.
@@ -337,6 +346,12 @@ impl<L: ObjectLayer> s3s::S3 for Aks3<L> {
         // chunk envelope as the object's bytes under a 200.
         reject_contradictory_aws_chunked(&req.headers)?;
 
+        // Which checksum, if any, the client asked aks3 to verify. Worked out
+        // before the input is consumed, because it reads the request headers and
+        // the trailing-headers handle alongside the parsed input.
+        let checksum =
+            crate::checksum::detect(&req.input, &req.headers, req.trailing_headers.as_ref());
+
         let input = req.input;
         // `s3s` makes the body optional because a malformed request can arrive
         // without one. An empty object is a body of zero bytes, not this.
@@ -346,21 +361,37 @@ impl<L: ObjectLayer> s3s::S3 for Aks3<L> {
         let opts = PutOpts {
             content_type: input.content_type,
             user_metadata: input.metadata.unwrap_or_default().into_iter().collect(),
+            // The engine computes and stores this algorithm's checksum in the
+            // same pass it hashes the etag; the value is verified by the stream
+            // wrapper below, before the engine commits anything.
+            checksum_algorithm: checksum.as_ref().map(|c| c.algorithm),
         };
 
-        let info = self
-            .engine
-            .put_object(
-                &input.bucket,
-                &input.key,
-                body.map_err(std::io::Error::other).boxed(),
-                opts,
-            )
-            .await
-            .map_err(map_engine_err)?;
+        let body: BoxByteStream = body.map_err(std::io::Error::other).boxed();
+        // With a checksum to check, the body streams through a verifier that
+        // fails it on a mismatch, which aborts the engine before it stores
+        // anything. Without one it goes straight through.
+        let body: BoxByteStream = match checksum {
+            Some(checksum) => crate::checksum::VerifyingStream::new(body, checksum).boxed(),
+            None => body,
+        };
 
+        let info = match self
+            .engine
+            .put_object(&input.bucket, &input.key, body, opts)
+            .await
+        {
+            Ok(info) => info,
+            Err(err) => return Err(crate::checksum::put_error(err)),
+        };
+
+        let fields = crate::checksum::fields_for(info.checksum.as_ref());
         Ok(S3Response::new(PutObjectOutput {
             e_tag: Some(ETag::Strong(info.etag)),
+            checksum_crc32: fields.crc32,
+            checksum_sha1: fields.sha1,
+            checksum_sha256: fields.sha256,
+            checksum_type: fields.checksum_type,
             ..Default::default()
         }))
     }
@@ -377,6 +408,11 @@ impl<L: ObjectLayer> s3s::S3 for Aks3<L> {
     ) -> S3Result<S3Response<GetObjectOutput>> {
         let input = req.input;
         let range = input.range.as_ref().map(to_byte_range);
+        // The stored checksum is returned only when the client asks for it and
+        // only for a whole-object read: it describes the whole object, so
+        // returning it on a ranged read would have the client's own validation
+        // compare it against a fragment and fail.
+        let want_checksum = range.is_none() && checksum_mode_enabled(input.checksum_mode.as_ref());
 
         let (info, offset, len, body) = self
             .engine
@@ -389,9 +425,12 @@ impl<L: ObjectLayer> s3s::S3 for Aks3<L> {
             content_type,
             mtime_epoch_ms,
             user_metadata,
+            checksum,
             ..
         } = info;
 
+        let fields =
+            crate::checksum::fields_for(want_checksum.then_some(checksum.as_ref()).flatten());
         Ok(S3Response::new(GetObjectOutput {
             body: Some(StreamingBlob::wrap(SyncStream(Mutex::new(body)))),
             accept_ranges: Some(ACCEPT_RANGES.to_owned()),
@@ -403,6 +442,10 @@ impl<L: ObjectLayer> s3s::S3 for Aks3<L> {
             e_tag: Some(ETag::Strong(etag)),
             last_modified: Some(Timestamp::from(epoch_ms_to_systemtime(mtime_epoch_ms))),
             metadata: Some(user_metadata.into_iter().collect()),
+            checksum_crc32: fields.crc32,
+            checksum_sha1: fields.sha1,
+            checksum_sha256: fields.sha256,
+            checksum_type: fields.checksum_type,
             ..Default::default()
         }))
     }
@@ -416,6 +459,7 @@ impl<L: ObjectLayer> s3s::S3 for Aks3<L> {
         req: S3Request<HeadObjectInput>,
     ) -> S3Result<S3Response<HeadObjectOutput>> {
         let input = req.input;
+        let want_checksum = checksum_mode_enabled(input.checksum_mode.as_ref());
         let info = self
             .engine
             .head_object(&input.bucket, &input.key)
@@ -427,9 +471,12 @@ impl<L: ObjectLayer> s3s::S3 for Aks3<L> {
             content_type,
             mtime_epoch_ms,
             user_metadata,
+            checksum,
             ..
         } = info;
 
+        let fields =
+            crate::checksum::fields_for(want_checksum.then_some(checksum.as_ref()).flatten());
         Ok(S3Response::new(HeadObjectOutput {
             accept_ranges: Some(ACCEPT_RANGES.to_owned()),
             content_length: Some(wire_length(size)),
@@ -437,6 +484,10 @@ impl<L: ObjectLayer> s3s::S3 for Aks3<L> {
             e_tag: Some(ETag::Strong(etag)),
             last_modified: Some(Timestamp::from(epoch_ms_to_systemtime(mtime_epoch_ms))),
             metadata: Some(user_metadata.into_iter().collect()),
+            checksum_crc32: fields.crc32,
+            checksum_sha1: fields.sha1,
+            checksum_sha256: fields.sha256,
+            checksum_type: fields.checksum_type,
             ..Default::default()
         }))
     }
@@ -540,11 +591,11 @@ mod tests {
         declares_aws_chunked, epoch_ms_to_systemtime, page_size, reject_contradictory_aws_chunked,
         Aks3, STREAMING_SENTINELS,
     };
-    use aks3_engine::FsEngine;
+    use aks3_engine::{ChecksumAlgorithm, FsEngine};
     use http::header::{HeaderName, HeaderValue};
     use s3s::dto::{
-        CreateBucketInput, DeleteBucketInput, DeleteObjectInput, ETag, GetObjectInput,
-        HeadBucketInput, HeadObjectInput, ListBucketsInput, ListObjectsV2Input,
+        ChecksumMode, CreateBucketInput, DeleteBucketInput, DeleteObjectInput, ETag,
+        GetObjectInput, HeadBucketInput, HeadObjectInput, ListBucketsInput, ListObjectsV2Input,
         ListObjectsV2Output, Metadata, PutObjectInput, Range, StreamingBlob, Timestamp,
     };
     use s3s::header::{CONTENT_ENCODING, X_AMZ_CONTENT_SHA256, X_AMZ_DECODED_CONTENT_LENGTH};
@@ -712,6 +763,196 @@ mod tests {
     /// The etag of `hello world`, as the engine spells it: bare lowercase hex.
     fn hello_world_etag() -> ETag {
         ETag::Strong("5eb63bbbe01eeed093cb22bb8f5acdc3".to_owned())
+    }
+
+    // --- integrity checksums (header form) ---
+    //
+    // The trailer form is exercised by the boto3 compliance suite, which is the
+    // only place a real aws-chunked trailer and its s3s `TrailingHeaders` handle
+    // can be produced: s3s 0.14 exposes no way to build that handle by hand. What
+    // these cover is the header form end to end through the S3 trait, plus the
+    // store/echo/return path both forms share once a value is in hand.
+
+    /// The base64 checksum of `bytes`, computed the way the engine does, so a
+    /// test names the value it expects rather than a hard-coded digest.
+    fn checksum_of(algorithm: ChecksumAlgorithm, bytes: &[u8]) -> String {
+        let mut hasher = algorithm.hasher();
+        hasher.update(bytes);
+        hasher.finalize_base64()
+    }
+
+    /// `PUT buk/<key>` carrying `bytes` and the header-form checksum `value` for
+    /// `algorithm`.
+    fn put_checksummed(
+        key: &str,
+        bytes: &'static [u8],
+        algorithm: ChecksumAlgorithm,
+        value: &str,
+    ) -> S3Request<PutObjectInput> {
+        let mut input = PutObjectInput {
+            bucket: "buk".to_owned(),
+            key: key.to_owned(),
+            body: Some(blob(bytes)),
+            ..Default::default()
+        };
+        match algorithm {
+            ChecksumAlgorithm::Crc32 => input.checksum_crc32 = Some(value.to_owned()),
+            ChecksumAlgorithm::Sha1 => input.checksum_sha1 = Some(value.to_owned()),
+            ChecksumAlgorithm::Sha256 => input.checksum_sha256 = Some(value.to_owned()),
+        }
+        req(input)
+    }
+
+    /// A `GET`/`HEAD` that asks for the stored checksum.
+    fn get_checked(key: &str) -> S3Request<GetObjectInput> {
+        req(GetObjectInput {
+            bucket: "buk".to_owned(),
+            key: key.to_owned(),
+            checksum_mode: Some(ChecksumMode::from_static(ChecksumMode::ENABLED)),
+            ..Default::default()
+        })
+    }
+
+    fn head_checked(key: &str) -> S3Request<HeadObjectInput> {
+        req(HeadObjectInput {
+            bucket: "buk".to_owned(),
+            key: key.to_owned(),
+            checksum_mode: Some(ChecksumMode::from_static(ChecksumMode::ENABLED)),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn a_correct_checksum_is_stored_echoed_and_returned() {
+        let (_d, s) = svc().await;
+        s.create_bucket(create("buk")).await.expect("create");
+        let value = checksum_of(ChecksumAlgorithm::Crc32, b"hello world");
+
+        // Echoed on the PutObject response, with the type single PUTs always have.
+        let put = s
+            .put_object(put_checksummed(
+                "k",
+                b"hello world",
+                ChecksumAlgorithm::Crc32,
+                &value,
+            ))
+            .await
+            .expect("put")
+            .output;
+        assert_eq!(put.checksum_crc32.as_deref(), Some(value.as_str()));
+        assert_eq!(
+            put.checksum_type.map(|t| t.as_str().to_owned()).as_deref(),
+            Some("FULL_OBJECT")
+        );
+
+        // Returned on GET and HEAD when asked for.
+        let got = s.get_object(get_checked("k")).await.expect("get").output;
+        assert_eq!(got.checksum_crc32.as_deref(), Some(value.as_str()));
+        let head = s.head_object(head_checked("k")).await.expect("head").output;
+        assert_eq!(head.checksum_crc32.as_deref(), Some(value.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_checksum_is_withheld_unless_the_reader_asks() {
+        let (_d, s) = svc().await;
+        s.create_bucket(create("buk")).await.expect("create");
+        let value = checksum_of(ChecksumAlgorithm::Crc32, b"hello world");
+        s.put_object(put_checksummed(
+            "k",
+            b"hello world",
+            ChecksumAlgorithm::Crc32,
+            &value,
+        ))
+        .await
+        .expect("put");
+
+        // A plain GET (no ChecksumMode) carries no checksum header.
+        let plain = s.get_object(get("k")).await.expect("get").output;
+        assert!(plain.checksum_crc32.is_none());
+
+        // A ranged GET does not either, even with the mode on: the stored value
+        // is for the whole object and would fail a client's validation of a slice.
+        let mut ranged = get_checked("k");
+        ranged.input.range = Some(Range::Int {
+            first: 0,
+            last: Some(4),
+        });
+        let ranged = s.get_object(ranged).await.expect("get range").output;
+        assert!(ranged.checksum_crc32.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_wrong_checksum_is_rejected_and_stores_nothing() {
+        let (_d, s) = svc().await;
+        s.create_bucket(create("buk")).await.expect("create");
+        // The checksum of a different body: correctly formed, wrong for this one.
+        let wrong = checksum_of(ChecksumAlgorithm::Crc32, b"a different body");
+
+        let err = s
+            .put_object(put_checksummed(
+                "k",
+                b"hello world",
+                ChecksumAlgorithm::Crc32,
+                &wrong,
+            ))
+            .await
+            .expect_err("a wrong checksum must be refused");
+        assert_eq!(*err.code(), S3ErrorCode::BadDigest);
+
+        // Nothing was stored: the key is absent, not holding the body under a
+        // checksum that describes something else.
+        let get_err = s
+            .get_object(get("k"))
+            .await
+            .expect_err("key must be absent");
+        assert_eq!(*get_err.code(), S3ErrorCode::NoSuchKey);
+    }
+
+    #[tokio::test]
+    async fn each_algorithm_verifies_stores_and_returns() {
+        let (_d, s) = svc().await;
+        s.create_bucket(create("buk")).await.expect("create");
+        for algorithm in [
+            ChecksumAlgorithm::Crc32,
+            ChecksumAlgorithm::Sha1,
+            ChecksumAlgorithm::Sha256,
+        ] {
+            let key = algorithm.as_str();
+            let value = checksum_of(algorithm, b"hello world");
+            s.put_object(put_checksummed(key, b"hello world", algorithm, &value))
+                .await
+                .unwrap_or_else(|e| panic!("{} put: {e:?}", algorithm.as_str()));
+
+            let got = s.get_object(get_checked(key)).await.expect("get").output;
+            let returned = match algorithm {
+                ChecksumAlgorithm::Crc32 => got.checksum_crc32,
+                ChecksumAlgorithm::Sha1 => got.checksum_sha1,
+                ChecksumAlgorithm::Sha256 => got.checksum_sha256,
+            };
+            assert_eq!(
+                returned.as_deref(),
+                Some(value.as_str()),
+                "{}",
+                algorithm.as_str()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wrong_sha256_is_also_rejected() {
+        let (_d, s) = svc().await;
+        s.create_bucket(create("buk")).await.expect("create");
+        let wrong = checksum_of(ChecksumAlgorithm::Sha256, b"a different body");
+        let err = s
+            .put_object(put_checksummed(
+                "k",
+                b"hello world",
+                ChecksumAlgorithm::Sha256,
+                &wrong,
+            ))
+            .await
+            .expect_err("a wrong sha256 must be refused");
+        assert_eq!(*err.code(), S3ErrorCode::BadDigest);
     }
 
     /// Drain a response body to the bytes it carried.

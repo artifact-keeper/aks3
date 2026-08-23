@@ -36,6 +36,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::atomic::write_json_atomic;
+use crate::checksum::StoredChecksum;
 
 /// Version id of an object stored in a bucket that has never had versioning on.
 ///
@@ -44,7 +45,16 @@ use crate::atomic::write_json_atomic;
 pub const NULL_VERSION_ID: &str = "null";
 
 /// Layout version stamped on manifests this build writes.
-pub const MANIFEST_FORMAT: u32 = 1;
+///
+/// Bumped to 2 when the per-version integrity checksum
+/// ([`VersionEntry::checksum`]) was added. The field is `serde(default)`, so a
+/// format-1 manifest written before it existed still loads. The bump is what
+/// stops the reverse hazard: an older binary that does not know the field would
+/// otherwise read a format-1 manifest that happened to carry a checksum, drop
+/// the field on the next rewrite, and leave the stamp unchanged. Writing 2 makes
+/// such a binary refuse the manifest ([`load_manifest`] rejects a newer format)
+/// rather than silently discard a stored checksum.
+pub const MANIFEST_FORMAT: u32 = 2;
 
 /// One version of one object.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -64,6 +74,12 @@ pub struct VersionEntry {
     /// A tombstone: the version exists in history but the object reads as gone.
     #[serde(default)]
     pub delete_marker: bool,
+    /// The object's integrity checksum, if one was supplied on upload. Arrived
+    /// with manifest format 2; `serde(default)` and skipped when absent, so an
+    /// older manifest without it loads and a version with no checksum serializes
+    /// exactly as it did at format 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<StoredChecksum>,
 }
 
 /// Every version of one object, newest first.
@@ -179,6 +195,7 @@ mod tests {
             user_metadata: BTreeMap::new(),
             mtime_epoch_ms: 0,
             delete_marker: false,
+            checksum: None,
         }
     }
 
@@ -276,14 +293,58 @@ mod tests {
 
     #[test]
     fn entry_deserializes_without_the_optional_fields() {
-        // Manifests written before user metadata or delete markers existed must
-        // still load; both fields are `serde(default)`.
+        // Manifests written before user metadata, delete markers or checksums
+        // existed must still load; all three fields are `serde(default)`.
         let json = r#"{"version_id":"null","etag":"aa","size":7,
             "content_type":"text/plain","mtime_epoch_ms":5}"#;
         let e: VersionEntry = serde_json::from_str(json).unwrap();
         assert!(e.user_metadata.is_empty());
         assert!(!e.delete_marker);
+        assert!(e.checksum.is_none());
         assert_eq!(e.size, 7);
+    }
+
+    /// A whole manifest from before checksums existed (format 1, no `checksum`
+    /// field on its entry) still loads on this build, with the checksum reading
+    /// as absent. This is the on-disk compatibility the format bump is careful
+    /// to keep: older manifests are read, only newer ones are refused.
+    #[tokio::test]
+    async fn a_format_1_manifest_without_a_checksum_still_loads() {
+        let guard = tempfile::tempdir().unwrap();
+        let p = guard.path().join("m.json");
+        tokio::fs::write(
+            &p,
+            br#"{"format":1,"versions":[{"version_id":"null","etag":"aa","size":3,
+                "content_type":"text/plain","mtime_epoch_ms":9}]}"#,
+        )
+        .await
+        .unwrap();
+
+        let m = load_manifest(&p).await.unwrap().unwrap();
+        assert_eq!(m.format, 1);
+        let e = m.latest().unwrap();
+        assert_eq!(e.etag, "aa");
+        assert!(
+            e.checksum.is_none(),
+            "an old manifest grew a checksum from nowhere"
+        );
+    }
+
+    /// A checksum stored on an entry survives the trip to disk and back, keyed by
+    /// its S3 algorithm name.
+    #[tokio::test]
+    async fn a_checksum_roundtrips_through_the_manifest() {
+        use crate::checksum::{ChecksumAlgorithm, StoredChecksum};
+        let (guard, tmp) = tmp_dir().await;
+        let p = guard.path().join("m.json");
+        let mut e = entry("null", "aa");
+        e.checksum = Some(StoredChecksum {
+            algorithm: ChecksumAlgorithm::Crc32,
+            value: "DUoRhQ==".into(),
+        });
+        let m = manifest(vec![e]);
+        store_manifest(&tmp, &p, &m).await.unwrap();
+        assert_eq!(load_manifest(&p).await.unwrap().unwrap(), m);
     }
 
     #[tokio::test]
@@ -341,7 +402,7 @@ mod tests {
         let p = guard.path().join("m.json");
         tokio::fs::write(
             &p,
-            br#"{"format":2,"versions":[],"retention":{"mode":"COMPLIANCE"}}"#,
+            br#"{"format":3,"versions":[],"retention":{"mode":"COMPLIANCE"}}"#,
         )
         .await
         .unwrap();
@@ -350,7 +411,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let msg = err.to_string();
         assert!(
-            msg.contains('2') && msg.contains(&MANIFEST_FORMAT.to_string()),
+            msg.contains('3') && msg.contains(&MANIFEST_FORMAT.to_string()),
             "{msg}"
         );
 
@@ -441,6 +502,7 @@ mod proptests {
             user_metadata: BTreeMap::new(),
             mtime_epoch_ms: 0,
             delete_marker,
+            checksum: None,
         }
     }
 
@@ -451,6 +513,23 @@ mod proptests {
             2 => "[ -~]{0,8}",
             1 => any::<String>(),
         ];
+        // A checksum is present about half the time, so the roundtrip covers both
+        // the field set and the `skip_serializing_if` absent case.
+        let checksum = prop_oneof![
+            1 => Just(None),
+            1 => (
+                prop::sample::select(vec![
+                    crate::checksum::ChecksumAlgorithm::Crc32,
+                    crate::checksum::ChecksumAlgorithm::Sha1,
+                    crate::checksum::ChecksumAlgorithm::Sha256,
+                ]),
+                "[A-Za-z0-9+/]{0,44}={0,2}",
+            )
+                .prop_map(|(algorithm, value)| Some(crate::checksum::StoredChecksum {
+                    algorithm,
+                    value,
+                })),
+        ];
         let entry = (
             any::<String>(),
             "[0-9a-f]{32}",
@@ -459,9 +538,10 @@ mod proptests {
             prop::collection::btree_map(text.clone(), text, 0..3),
             any::<u64>(),
             any::<bool>(),
+            checksum,
         )
-            .prop_map(|(version_id, etag, size, ctype, meta, mtime, marker)| {
-                VersionEntry {
+            .prop_map(
+                |(version_id, etag, size, ctype, meta, mtime, marker, checksum)| VersionEntry {
                     version_id,
                     etag,
                     size,
@@ -469,8 +549,9 @@ mod proptests {
                     user_metadata: meta,
                     mtime_epoch_ms: mtime,
                     delete_marker: marker,
-                }
-            });
+                    checksum,
+                },
+            );
         (0_u32..=MANIFEST_FORMAT, prop::collection::vec(entry, 0..4))
             .prop_map(|(format, versions)| VersionManifest { format, versions })
     }

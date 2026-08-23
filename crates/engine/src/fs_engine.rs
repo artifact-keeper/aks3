@@ -107,6 +107,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use crate::atomic::{write_json_atomic, StagedFile};
+use crate::checksum::{ChecksumAlgorithm, StoredChecksum};
 use crate::error::EngineError;
 use crate::layer::{
     BoxByteStream, BucketInfo, ByteRange, ListParams, ListResult, ObjectInfo, ObjectLayer, PutOpts,
@@ -522,14 +523,31 @@ impl ObjectLayer for FsEngine {
 
         let mut staged = StagedFile::create(&self.tmp_dir()).await?;
         let mut hasher = Md5::new();
+        // The requested integrity checksum, computed in the same pass as the
+        // etag rather than by re-reading the body. The API layer, which owns the
+        // client's expected value and (for the aws-chunked trailer form) can only
+        // read it once the body is consumed, verifies it as the body streams and
+        // fails the stream before this loop finishes on a mismatch; what reaches
+        // here is a body that already matched, so the engine only records it.
+        let mut checksummer = opts.checksum_algorithm.map(ChecksumAlgorithm::hasher);
         let mut size: u64 = 0;
         while let Some(chunk) = body.next().await {
             let chunk = chunk?;
             hasher.update(&chunk);
+            if let Some(c) = checksummer.as_mut() {
+                c.update(&chunk);
+            }
             size += chunk.len() as u64;
             staged.write_all(&chunk).await?;
         }
 
+        let checksum = opts
+            .checksum_algorithm
+            .zip(checksummer)
+            .map(|(algorithm, c)| StoredChecksum {
+                algorithm,
+                value: c.finalize_base64(),
+            });
         let entry = VersionEntry {
             version_id: NULL_VERSION_ID.to_owned(),
             etag: hex_lower(&hasher.finalize()),
@@ -541,6 +559,7 @@ impl ObjectLayer for FsEngine {
             user_metadata: opts.user_metadata,
             mtime_epoch_ms: now_epoch_ms(),
             delete_marker: false,
+            checksum,
         };
 
         let _bucket_lock = self.lock_bucket_shared(bucket).await;
@@ -871,6 +890,7 @@ fn object_info(key: String, entry: &VersionEntry) -> ObjectInfo {
         content_type: entry.content_type.clone(),
         mtime_epoch_ms: entry.mtime_epoch_ms,
         user_metadata: entry.user_metadata.clone(),
+        checksum: entry.checksum.clone(),
     }
 }
 

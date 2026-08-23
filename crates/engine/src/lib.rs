@@ -12,6 +12,7 @@
 //! that turns an object tree back into keys ([`walk`]).
 
 pub mod atomic;
+pub mod checksum;
 pub mod error;
 pub mod fs_engine;
 pub mod layer;
@@ -19,6 +20,7 @@ pub mod meta;
 pub mod paths;
 pub mod walk;
 
+pub use checksum::{ChecksumAlgorithm, Checksummer, StoredChecksum};
 pub use error::EngineError;
 pub use fs_engine::FsEngine;
 pub use layer::*;
