@@ -279,6 +279,32 @@ mod tests {
         );
     }
 
+    /// A second, independent multi-byte vector for each hand-rolled CRC. The
+    /// boto3 harness cannot cross-check these (no awscrt), so a single vector is
+    /// thin insurance for a from-scratch primitive: a second one over a different
+    /// input catches a wrong polynomial or byte order that the first happened to
+    /// survive. Values computed over `"hello world"`.
+    ///
+    /// CRC-32C (Castagnoli) of "hello world" = `0xC994_65AA`.
+    /// CRC-64/NVME of "hello world" = `0x8D29_D5C3_F6EA_8EBE`.
+    #[test]
+    fn reflected_crc_second_vectors() {
+        // Asserted both as the literal base64 a client would see and as the
+        // base64 of the raw check integer, so the two spellings cross-check.
+        let mut crc32c = ChecksumAlgorithm::Crc32c.hasher();
+        crc32c.update(b"hello world");
+        assert_eq!(crc32c.finalize_base64(), "yZRlqg==");
+        assert_eq!("yZRlqg==", STANDARD.encode(0xC994_65AA_u32.to_be_bytes()));
+
+        let mut crc64 = ChecksumAlgorithm::Crc64Nvme.hasher();
+        crc64.update(b"hello world");
+        assert_eq!(crc64.finalize_base64(), "jSnVw/bqjr4=");
+        assert_eq!(
+            "jSnVw/bqjr4=",
+            STANDARD.encode(0x8D29_D5C3_F6EA_8EBE_u64.to_be_bytes())
+        );
+    }
+
     /// CRC32 matches what boto3 computes: base64 of the four big-endian bytes of
     /// the IEEE CRC. `zlib.crc32(b"hello world") == 0x0d4a1185`, so the value is
     /// `base64(0x0d, 0x4a, 0x11, 0x85)`.
