@@ -12,13 +12,25 @@ back if the server sends it. That change broke a long list of third-party S3
 implementations, and it is the single most likely thing to go wrong between
 aks3 and a real client. This file is the record of exactly where aks3 stands.
 
-**Phase 0 aks3 does not implement checksums.** s3s parses the headers and
-verifies the aws-chunked framing and, on the signed path, its trailer
-signature, but no x-amz-checksum-* value is ever compared against the body,
-stored, or returned. Every test here that pins a divergence from AWS says so in
-its own words and carries a FIXME naming issue #38, the Phase 1 checksum
-matrix. They pass today because they describe today; when the matrix lands they
-are the tests that fail and tell you what to change.
+**Phase 1 aks3 verifies, stores and returns checksums.** Issue #38 landed the
+single-object PutObject checksum matrix: aks3 now checks the client's
+x-amz-checksum-* value against the body (header form and aws-chunked trailer
+form both), answers 400 on a mismatch and stores nothing, records the checksum
+with the object, echoes it on the PutObject response with ChecksumType, and
+returns it on GetObject and HeadObject when ChecksumMode=ENABLED. The trailer
+form is checkable because s3s decodes the framing and exposes the trailing
+header to the handler through S3Request.trailing_headers once the body is
+consumed; it verifies the trailer signature but not the checksum value, so the
+value comparison is aks3's to make, and it makes it.
+
+All five S3 algorithms are verified server-side: CRC32, CRC32C, SHA1, SHA256 and
+CRC64NVME. This file only exercises CRC32/SHA1/SHA256 end to end, because
+CRC32C and CRC64NVME need boto3's awscrt extra, which the lockfile omits
+(test_crt_algorithms_are_out_of_reach pins that client limit). The two CRT
+algorithms are covered by the Rust suite instead (server-side verify does not
+depend on the client being able to send them). The invariant either way: a
+checksum requested for any algorithm is verified or the request is refused,
+never stored unverified.
 
 One divergence found alongside these has no SDK that produces it, and unlike
 the rest it has been fixed rather than pinned: a PUT that declares
@@ -134,33 +146,28 @@ def test_default_put_sends_a_crc32_header(s3, bucket, wire):
     assert s3.get_object(Bucket=bucket, Key="default")["Body"].read() == PAYLOAD
 
 
-def test_put_response_omits_the_checksum(s3, bucket):
-    """DIVERGENCE FROM AWS, pinned deliberately.
+def test_put_response_includes_the_checksum(s3, bucket):
+    """The PutObject response echoes the stored checksum and its type.
 
-    Real S3 echoes the checksum it stored in the PutObject response, and boto3
-    surfaces it as `ChecksumCRC32` alongside `ChecksumType: FULL_OBJECT`. aks3
-    returns neither, because it stores neither.
+    Real S3 echoes the checksum it stored, and boto3 surfaces it as
+    `ChecksumCRC32` alongside `ChecksumType: FULL_OBJECT`. Since #38 aks3 does
+    too: it is the end-to-end confirmation the header exists to provide.
 
-    Harmless to boto3 today, which does not validate a PutObject response
-    checksum, and invisible to a caller who never looks. It costs the caller
-    the end-to-end confirmation the header exists to provide.
-
-    FIXME(#38): when the Phase 1 checksum matrix lands, this assertion inverts: the
-    response should carry ChecksumCRC32 equal to crc32_b64(PAYLOAD).
+    (Inverted from test_put_response_omits_the_checksum per issue #38.)
     """
     response = s3.put_object(Bucket=bucket, Key="default", Body=PAYLOAD)
 
-    assert "ChecksumCRC32" not in response
-    assert "ChecksumType" not in response
+    assert response["ChecksumCRC32"] == crc32_b64(PAYLOAD)
+    assert response["ChecksumType"] == "FULL_OBJECT"
 
 
 @pytest.mark.parametrize("algorithm", ["CRC32", "SHA1", "SHA256"])
 def test_explicitly_requested_algorithms_are_accepted(s3, bucket, wire, algorithm):
     """Every algorithm boto3 can compute without the CRT is accepted.
 
-    Accepted, not verified: see test_a_wrong_checksum_is_not_rejected. What is
-    being pinned is that none of them is a 400, because a caller who asks for
-    SHA256 explicitly is usually a caller with a compliance reason to.
+    Accepted and, since #38, verified: a correct value roundtrips without a 400,
+    and a wrong one is caught (test_a_wrong_checksum_is_rejected). A caller who
+    asks for SHA256 explicitly is usually a caller with a compliance reason to.
     """
     key = f"explicit-{algorithm.lower()}"
     response = s3.put_object(
@@ -196,29 +203,26 @@ def test_crt_algorithms_are_out_of_reach(s3, bucket, algorithm):
         )
 
 
-def test_a_wrong_checksum_is_not_rejected(s3, bucket, endpoint, credentials):
-    """DIVERGENCE FROM AWS, and the sharpest one in this file.
-
-    A correctly signed PutObject whose x-amz-checksum-crc32 does not match the
-    body is accepted with a 200. Real S3 answers 400 InvalidRequest, because the
-    entire point of the header is to catch a body that changed in transit.
+def test_a_wrong_checksum_is_rejected(s3, bucket, endpoint, credentials):
+    """A signed PutObject whose x-amz-checksum-crc32 does not match the body is
+    refused with 400 and stores nothing.
 
     The request is hand-built rather than made through the client because boto3
     computes the checksum itself and offers no way to lie in it. The signature
     is real and covers the wrong value, so the server is being asked precisely
-    the question "do you check this?" and the answer today is no.
+    the question "do you check this?" and since #38 the answer is yes.
 
-    In practice a body corrupted in transit would still fail SigV4 payload
-    signing on this path, so this is not an open corruption hole so much as a
-    guarantee that is not being provided. On the unsigned-payload paths
-    (presigned PUT, streaming trailer) the checksum is the only integrity check
-    there is, and it is not being made.
+    aks3 answers 400 BadDigest, the code AWS uses when a supplied checksum does
+    not match what it received, and stores nothing: the point of the header is
+    to catch a body that changed in transit, and on the unsigned-payload paths
+    (presigned PUT, streaming trailer) it is the only integrity check there is.
 
-    FIXME(#38): when the Phase 1 checksum matrix lands this becomes a test that the
-    server answers 400 InvalidRequest and stores nothing.
+    (Inverted from test_a_wrong_checksum_is_not_rejected per issue #38.)
     """
     import http.client
     import urllib.parse
+
+    from botocore.exceptions import ClientError
 
     access_key, secret_key = credentials
     key = "wrong-checksum"
@@ -244,45 +248,46 @@ def test_a_wrong_checksum_is_not_rejected(s3, bucket, endpoint, credentials):
     body = response.read()
     connection.close()
 
-    assert response.status == 200, body
-    # And the bytes are there, under a checksum that describes something else.
-    assert s3.get_object(Bucket=bucket, Key=key)["Body"].read() == PAYLOAD
+    assert response.status == 400, body
+    assert b"BadDigest" in body
+
+    # Nothing was stored: the key is absent, not holding the body under a
+    # checksum that describes something else.
+    with pytest.raises(ClientError) as excinfo:
+        s3.get_object(Bucket=bucket, Key=key)
+    assert excinfo.value.response["Error"]["Code"] == "NoSuchKey"
 
 
 def test_get_with_checksum_mode_enabled(s3, bucket):
-    """DIVERGENCE FROM AWS: ChecksumMode=ENABLED has nothing to enable.
+    """ChecksumMode=ENABLED returns the stored checksum, and boto3 validates it.
 
     boto3 asks for the stored checksum with `x-amz-checksum-mode: ENABLED` and
-    validates whatever comes back. aks3 sends no checksum header, so the SDK's
-    validation is a no-op that cannot fail. The GET succeeds and the bytes are
-    right - it is the end-to-end integrity guarantee that is absent, not the
-    data.
+    validates whatever comes back against the body it downloaded. Since #38 aks3
+    returns the checksum it stored on the PUT, so the read is checked end to end:
+    a GET that succeeds is a GET whose bytes matched their checksum.
 
-    Asserted as "no checksum field of any kind" rather than "no CRC32", so that
-    a Phase 1 implementation that returns a different algorithm still trips it.
-
-    FIXME(#38): when the Phase 1 checksum matrix lands, this inverts to
-    response["ChecksumCRC32"] == crc32_b64(PAYLOAD).
+    (Inverted from the no-checksum-returned pin per issue #38.)
     """
     s3.put_object(Bucket=bucket, Key="checked", Body=PAYLOAD)
 
     response = s3.get_object(Bucket=bucket, Key="checked", ChecksumMode="ENABLED")
 
     assert response["Body"].read() == PAYLOAD
-    assert not [k for k in response if k.startswith("Checksum")]
-    assert not [h for h in response["ResponseMetadata"]["HTTPHeaders"] if "checksum" in h]
+    assert response["ChecksumCRC32"] == crc32_b64(PAYLOAD)
+    assert response["ChecksumType"] == "FULL_OBJECT"
 
 
 def test_head_with_checksum_mode_enabled(s3, bucket):
-    """Same divergence on the HEAD path, which s3transfer uses to plan reads.
+    """Same on the HEAD path, which s3transfer uses to plan reads.
 
-    FIXME(#38): Phase 1 checksum matrix, as above.
+    (Inverted per issue #38, as above.)
     """
     s3.put_object(Bucket=bucket, Key="checked", Body=PAYLOAD)
 
     response = s3.head_object(Bucket=bucket, Key="checked", ChecksumMode="ENABLED")
 
-    assert not [k for k in response if k.startswith("Checksum")]
+    assert response["ChecksumCRC32"] == crc32_b64(PAYLOAD)
+    assert response["ChecksumType"] == "FULL_OBJECT"
 
 
 def test_aws_chunked_trailer_upload_is_decoded(s3, bucket, wire):
@@ -349,32 +354,30 @@ def test_aws_chunked_trailer_upload_of_a_large_body(s3, bucket, wire):
     assert got["Body"].read() == payload
 
 
-def test_a_wrong_trailer_checksum_is_not_rejected(s3, bucket, endpoint, credentials):
-    """DIVERGENCE FROM AWS, and the one with no second line of defence.
+def test_a_wrong_trailer_checksum_is_rejected(s3, bucket, endpoint, credentials):
+    """The trailer form, verified: a wrong trailing checksum is refused with 400
+    and stores nothing.
 
-    The header-form counterpart above is softened by SigV4 payload signing: a
-    body corrupted in transit fails the signature there whether or not the
-    checksum is checked. This path has no such cover. `x-amz-content-sha256:
-    STREAMING-UNSIGNED-PAYLOAD-TRAILER` means exactly what it says - the seed
-    signature covers the headers and not the body - and AWS relies on the
-    trailing checksum as the body's integrity check. aks3 decodes the framing
-    correctly and then does not check the trailer, so on the path a default
-    boto3 takes over HTTPS there is currently no body-integrity check at all.
+    This is the path with no second line of defence. `x-amz-content-sha256:
+    STREAMING-UNSIGNED-PAYLOAD-TRAILER` means the seed signature covers the
+    headers and not the body, and AWS relies on the trailing checksum as the
+    body's integrity check. s3s decodes the framing and exposes the trailing
+    header to the handler once the body is consumed (it verifies the trailer
+    *signature*, not the value), so since #38 aks3 compares that value against
+    the body it received and answers 400 on a mismatch. On the path a default
+    boto3 takes over HTTPS there is now a body-integrity check.
 
     Hand-built for the same reason as the header case: boto3 computes the
     trailer itself and will not lie in it. `payload()` is overridden rather than
     the header being set after signing, because the sentinel has to be the value
     the canonical request was built from or the signature would not verify.
 
-    In a real deployment TLS covers the wire, so this is not a remotely
-    exploitable substitution. What it means is that TLS is doing all of the
-    integrity work and S3's own end-to-end mechanism none of it.
-
-    FIXME(#38): when the Phase 1 checksum matrix lands this becomes a test that
-    the server answers 400 and stores nothing.
+    (Inverted from test_a_wrong_trailer_checksum_is_not_rejected per issue #38.)
     """
     import http.client
     import urllib.parse
+
+    from botocore.exceptions import ClientError
 
     access_key, secret_key = credentials
     key = "wrong-trailer-checksum"
@@ -413,13 +416,73 @@ def test_a_wrong_trailer_checksum_is_not_rejected(s3, bucket, endpoint, credenti
     body = response.read()
     connection.close()
 
-    assert response.status == 200, body
-    # The framing was decoded, so this really did take the trailer path and the
-    # object is the body rather than the chunk envelope. It is stored under a
-    # checksum describing something else entirely.
-    stored = s3.get_object(Bucket=bucket, Key=key)
-    assert stored["ContentLength"] == len(PAYLOAD)
-    assert stored["Body"].read() == PAYLOAD
+    assert response.status == 400, body
+    assert b"BadDigest" in body
+
+    # The framing was decoded (this really did take the trailer path), the
+    # trailer did not match, and nothing was committed: the key is absent.
+    with pytest.raises(ClientError) as excinfo:
+        s3.get_object(Bucket=bucket, Key=key)
+    assert excinfo.value.response["Error"]["Code"] == "NoSuchKey"
+
+
+def test_a_declared_trailer_with_no_value_is_rejected(s3, bucket, endpoint, credentials):
+    """A checksum announced via x-amz-trailer but never sent is refused, not
+    stored unverified.
+
+    Once a request commits to a trailing checksum (x-amz-trailer names one and
+    the payload is a streaming-trailer sentinel), the value has to arrive or
+    there is nothing to check the body against. A server that let the empty
+    trailer through would be storing on faith exactly what the checksum exists
+    to prevent. aks3 answers 400 and stores nothing.
+
+    Hand-built: the framing carries the final 0-chunk and an empty trailer block,
+    with no x-amz-checksum-crc32 line, so detect() commits to the trailer form
+    but the value resolves to absent.
+    """
+    import http.client
+    import urllib.parse
+
+    from botocore.exceptions import ClientError
+
+    access_key, secret_key = credentials
+    key = "declared-but-missing-trailer"
+    # Final 0-chunk, then an empty trailer block: the CRLF that would separate
+    # trailers from the end, with no trailer line between.
+    framed = b"%x\r\n" % len(PAYLOAD) + PAYLOAD + b"\r\n0\r\n\r\n"
+
+    class StreamingTrailer(botocore.auth.S3SigV4Auth):
+        def payload(self, request):
+            return "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
+
+    request = botocore.awsrequest.AWSRequest(
+        method="PUT",
+        url=f"{endpoint}/{bucket}/{key}",
+        data=framed,
+        headers={
+            "Content-Encoding": "aws-chunked",
+            "X-Amz-Trailer": "x-amz-checksum-crc32",
+            "X-Amz-Decoded-Content-Length": str(len(PAYLOAD)),
+            "Content-Length": str(len(framed)),
+        },
+    )
+    StreamingTrailer(
+        Credentials(access_key, secret_key), "s3", "us-east-1"
+    ).add_auth(request)
+    prepared = request.prepare()
+
+    parsed = urllib.parse.urlparse(prepared.url)
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=30)
+    connection.request("PUT", parsed.path, body=framed, headers=dict(prepared.headers))
+    response = connection.getresponse()
+    body = response.read()
+    connection.close()
+
+    assert response.status == 400, body
+
+    with pytest.raises(ClientError) as excinfo:
+        s3.get_object(Bucket=bucket, Key=key)
+    assert excinfo.value.response["Error"]["Code"] == "NoSuchKey"
 
 
 def test_a_contradictory_aws_chunked_put_is_rejected(s3, bucket, endpoint, credentials):

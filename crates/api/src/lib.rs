@@ -5,6 +5,7 @@
 
 //! The S3 front end: the `s3s` service and the error mapping it answers with.
 
+mod checksum;
 pub mod error;
 pub mod service;
 

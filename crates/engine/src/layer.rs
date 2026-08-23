@@ -22,6 +22,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::checksum::{ChecksumAlgorithm, StoredChecksum};
 use crate::error::EngineError;
 
 /// An object body in motion: chunks of bytes, or the I/O error that stopped
@@ -50,6 +51,10 @@ pub struct ObjectInfo {
     /// User metadata, without the `x-amz-meta-` prefix. Sorted, so a response
     /// built from it is byte-for-byte reproducible.
     pub user_metadata: BTreeMap<String, String>,
+    /// The integrity checksum stored with the object, if one was supplied on
+    /// upload. `GET`/`HEAD` return it when the client asks with
+    /// `ChecksumMode=ENABLED`.
+    pub checksum: Option<StoredChecksum>,
 }
 
 /// The parts of a `PUT` that are not the body.
@@ -60,6 +65,12 @@ pub struct ObjectInfo {
 pub struct PutOpts {
     pub content_type: Option<String>,
     pub user_metadata: BTreeMap<String, String>,
+    /// When set, the engine computes this algorithm's checksum in the same pass
+    /// it hashes the etag and stores the `{algorithm, value}` pair with the
+    /// object. Verification against a client-supplied value is the API layer's
+    /// job (it happens as the body streams, before anything is committed); the
+    /// engine only records what it computed.
+    pub checksum_algorithm: Option<ChecksumAlgorithm>,
 }
 
 /// A resolved HTTP `Range` header, with **inclusive** bounds.
