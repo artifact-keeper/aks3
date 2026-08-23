@@ -62,6 +62,19 @@ teardown() {
   echo "aks3 enospc: unmounted $MOUNT and removed $IMAGE"
 }
 
+# Half a setup is worse than none: an image formatted but not mounted, or a
+# mount whose ownership was never handed over, leaves the next run to guess what
+# state it is in. Failing all the way back to nothing means the next run starts
+# where this one did. The handler disarms itself first, so a teardown that fails
+# in turn reports that rather than looping.
+# shellcheck disable=SC2329  # invoked by the ERR trap below
+on_error() {
+  trap - ERR
+  echo "aks3 enospc: setup failed, unwinding" >&2
+  teardown
+  exit 1
+}
+
 case "${1-}" in
   --teardown)
     teardown
@@ -79,15 +92,26 @@ if [ "$(uname -s)" != "Linux" ]; then
   exit 1
 fi
 
+# mkfs.ext4 lives in /usr/sbin, which is not on an ordinary user's PATH on
+# Debian and its derivatives, so it is invoked through as_root below. Checked up
+# front all the same: "install e2fsprogs" is a more useful thing to read than
+# sudo reporting a command it could not find.
+if ! as_root sh -c 'command -v mkfs.ext4 >/dev/null'; then
+  echo "aks3 enospc: mkfs.ext4 not found, install e2fsprogs" >&2
+  exit 1
+fi
+
 # A stale mount from an earlier run would leave the leg filling a filesystem
-# that already holds someone else's data, so start from nothing.
+# that already holds someone else's data, so start from nothing. Before the trap
+# is armed: this teardown is the expected path, not a failure to unwind from.
 teardown
+trap on_error ERR
 
 mkdir -p "$(dirname "$IMAGE")"
 truncate -s "${SIZE_MB}M" "$IMAGE"
 # -F because the target is a file rather than a block device, -q because a
 # mkfs banner in the CI log tells nobody anything.
-mkfs.ext4 -F -q "$IMAGE"
+as_root mkfs.ext4 -F -q "$IMAGE"
 
 as_root mkdir -p "$MOUNT"
 as_root mount -o loop "$IMAGE" "$MOUNT"
