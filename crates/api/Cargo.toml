@@ -12,11 +12,13 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
+# `S3Request::headers` is an `http::HeaderMap`, which put_object inspects to
+# reject a request that declares aws-chunked framing without a streaming
+# payload sentinel. The same types build an `S3Request` by hand in the tests
+# (s3s 0.14 has no constructor).
+http = { workspace = true }
 
 [dev-dependencies]
-# Building an `S3Request` by hand (s3s 0.14 has no constructor) needs the http
-# types its context fields are made of.
-http = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 

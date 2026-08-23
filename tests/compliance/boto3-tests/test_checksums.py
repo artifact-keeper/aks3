@@ -20,12 +20,15 @@ its own words and carries a FIXME naming issue #38, the Phase 1 checksum
 matrix. They pass today because they describe today; when the matrix lands they
 are the tests that fail and tell you what to change.
 
-One divergence found alongside these is deliberately not tested here: a PUT
-that declares `Content-Encoding: aws-chunked` while signing a non-streaming
-payload sentinel is answered 200 with the chunk framing stored as object bytes.
-No SDK produces that combination, so there is no golden path to hang it on, and
-it is tracked as issue #37 with its reproduction. When that is fixed the test
-belongs here.
+One divergence found alongside these has no SDK that produces it, and unlike
+the rest it has been fixed rather than pinned: a PUT that declares
+`Content-Encoding: aws-chunked` while signing a non-streaming payload sentinel.
+s3s decides whether a body is aws-chunked from `x-amz-content-sha256` alone, so
+such a request once stored the chunk framing as object bytes under a 200. aks3
+now rejects the contradiction with a 400 before the body is touched (issue #37),
+and `test_a_contradictory_aws_chunked_put_is_rejected` holds it there. Because
+no SDK sends that combination the request is hand-built, the way the
+wrong-checksum tests below are.
 
 There are two wire forms and this file exercises both:
 
@@ -417,6 +420,69 @@ def test_a_wrong_trailer_checksum_is_not_rejected(s3, bucket, endpoint, credenti
     stored = s3.get_object(Bucket=bucket, Key=key)
     assert stored["ContentLength"] == len(PAYLOAD)
     assert stored["Body"].read() == PAYLOAD
+
+
+def test_a_contradictory_aws_chunked_put_is_rejected(s3, bucket, endpoint, credentials):
+    """Issue #37: aws-chunked declared, but signed with a non-streaming sentinel.
+
+    s3s keys the aws-chunked decode off `x-amz-content-sha256` alone and ignores
+    `Content-Encoding` and `x-amz-decoded-content-length`. A request that
+    declares the framing but signs `UNSIGNED-PAYLOAD` therefore disagreed with
+    itself, and the raw chunk envelope (`3f\\r\\n...0\\r\\n\\r\\n`) was stored as
+    the object's bytes: 63 bytes of body became 74 stored bytes, the ETag was the
+    MD5 of the framing, and a 200 was returned. Silent corruption, discovered
+    only when the object was read back.
+
+    No SDK produces this combination, so the request is hand-built the way the
+    wrong-checksum cases above are. `payload()` is overridden rather than the
+    header set after signing, because `UNSIGNED-PAYLOAD` has to be the value the
+    canonical request was signed from or the signature would not verify, and the
+    framed body is put on the socket by hand.
+
+    aks3 now refuses the contradiction with 400 InvalidRequest before the body is
+    touched, and stores nothing. This is the request from the issue, verbatim.
+    """
+    import http.client
+    import urllib.parse
+
+    from botocore.exceptions import ClientError
+
+    access_key, secret_key = credentials
+    key = "contradictory-chunked"
+    framed = (b"%x\r\n" % len(PAYLOAD)) + PAYLOAD + b"\r\n0\r\n\r\n"
+
+    class Unsigned(botocore.auth.S3SigV4Auth):
+        def payload(self, request):
+            return "UNSIGNED-PAYLOAD"
+
+    request = botocore.awsrequest.AWSRequest(
+        method="PUT",
+        url=f"{endpoint}/{bucket}/{key}",
+        data=framed,
+        headers={
+            "Content-Encoding": "aws-chunked",
+            "x-amz-decoded-content-length": str(len(PAYLOAD)),
+            "Content-Length": str(len(framed)),
+        },
+    )
+    Unsigned(Credentials(access_key, secret_key), "s3", "us-east-1").add_auth(request)
+    prepared = request.prepare()
+
+    parsed = urllib.parse.urlparse(prepared.url)
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=30)
+    connection.request("PUT", parsed.path, body=framed, headers=dict(prepared.headers))
+    response = connection.getresponse()
+    body = response.read()
+    connection.close()
+
+    assert response.status == 400, body
+    assert b"InvalidRequest" in body
+
+    # The framing was never decoded into an object: the key is absent, not
+    # storing the chunk envelope under an etag that describes it.
+    with pytest.raises(ClientError) as excinfo:
+        s3.get_object(Bucket=bucket, Key=key)
+    assert excinfo.value.response["Error"]["Code"] == "NoSuchKey"
 
 
 def test_checksum_calculation_can_be_turned_off(client_factory, bucket):
