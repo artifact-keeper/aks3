@@ -23,7 +23,7 @@
 # where Dependabot looks: it resolves with an interpreter of its own choosing,
 # and a bump resolved under a different one would quietly move the markers.
 PyYAML
-boto3 >=1.0.0
+boto3 >=1.43.80
 botocore
 munch >=2.0.0
 # 0.14 switches to libev, that means bootstrap needs to change too
@@ -50,7 +50,7 @@ pytest-timeout
 # botocore 1.36 (January 2025) is where request_checksum_calculation started
 # defaulting to when_supported, which is the wire behaviour that suite exists to
 # pin; boto3 1.36 is the release that carries it. The bound is stated here
-# rather than left to the upstream block above, whose `boto3 >=1.0.0` would
+# rather than left to the upstream block above, whose `boto3 >=1.43.80` would
 # happily resolve to something from before the change and leave the suite
 # passing while testing nothing it claims to. It also means a future
 # S3_TESTS_REF that drops boto3 from its own requirements cannot silently take
