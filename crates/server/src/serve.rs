@@ -37,6 +37,8 @@ use aks3_engine::FsEngine;
 use aks3_iam::{IamAuth, RootCredentials};
 use s3s::service::{S3Service, S3ServiceBuilder};
 
+use crate::host::VirtualHostDomains;
+
 use crate::config::{Config, TlsConfig};
 
 /// How long the accept loop waits after a failed `accept` before trying again.
@@ -97,6 +99,16 @@ pub async fn run(
     let service = {
         let mut builder = S3ServiceBuilder::new(Aks3::new(Arc::new(engine)));
         builder.set_auth(IamAuth::new(credentials));
+        // Only with a domain to match against: a host parser that is set reads
+        // every non-address `Host` header, so an empty list has to mean no
+        // parser at all rather than a parser that matches nothing.
+        if !cfg.virtual_host_domains.is_empty() {
+            tracing::info!(
+                domains = ?cfg.virtual_host_domains,
+                "virtual-hosted-style addressing enabled"
+            );
+            builder.set_host(VirtualHostDomains::new(cfg.virtual_host_domains.clone()));
+        }
         builder.build()
     };
 

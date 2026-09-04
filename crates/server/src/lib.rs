@@ -10,4 +10,5 @@
 //! a server in-process.
 
 pub mod config;
+pub mod host;
 pub mod serve;

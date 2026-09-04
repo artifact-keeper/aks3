@@ -37,7 +37,9 @@ Phase 0 is a single node serving one data directory. Nine S3 operations are
 implemented: `CreateBucket`, `HeadBucket`, `DeleteBucket`, `ListBuckets`,
 `PutObject`, `GetObject` (including byte ranges), `HeadObject`, `DeleteObject`,
 and `ListObjectsV2` with prefixes, delimiters, and pagination. Requests are
-authenticated with SigV4 against a single root credential.
+authenticated with SigV4 against a single root credential, and may address a
+bucket path-style or, once a domain is configured, virtual-hosted style (see
+[Addressing](#addressing)).
 
 ## Quickstart
 
@@ -76,7 +78,10 @@ address it bound before it accepts anything.
 credentials have no default and have to be set, so the shortest config that
 works is those two lines on their own.
 
-Five environment variables override the file, which is what lets an image ship
+`virtual_host_domains` is empty by default, which leaves every request read as
+path style; see [Addressing](#addressing).
+
+Six environment variables override the file, which is what lets an image ship
 a config and still take its credentials at run time:
 
 | Variable | Sets |
@@ -86,6 +91,7 @@ a config and still take its credentials at run time:
 | `AKS3_ROOT_USER` | `root_access_key` |
 | `AKS3_ROOT_PASSWORD` | `root_secret_key` |
 | `AKS3_SHUTDOWN_GRACE` | `shutdown_grace_seconds` |
+| `AKS3_VIRTUAL_HOST_DOMAINS` | `virtual_host_domains` (comma-separated) |
 
 With the credentials in the environment there is no need for a file at all:
 
@@ -116,26 +122,44 @@ aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://demo/readme.md
 aws --endpoint-url http://127.0.0.1:9000 s3 rb s3://demo
 ```
 
-Path-style addressing is required, because aks3 does not parse virtual-host
-style (`bucket.host`) requests yet. Nothing above configures it: the AWS CLI
-already uses path style whenever `--endpoint-url` names a custom endpoint, so
-the block works as it stands.
-
-The one way to break that is to ask for the other style explicitly, with
-`addressing_style = virtual` under an `s3` key in `~/.aws/config`. A client
-configured that way puts the bucket in the hostname, aks3 does not recognise the
-request, and the answer is `NotImplemented`. If some profile has done that, set
-it back for this endpoint:
-
-```
-aws configure set default.s3.addressing_style path
-```
-
-That setting lives in the config file only. There is no environment variable for
-it, so exporting one has no effect.
-
 The same operations driven from the AWS SDK for Rust are what
 `crates/server/tests/smoke.rs` runs on every `cargo test`.
+
+### Addressing
+
+A client can name the bucket in the path (`/demo/readme.md`, path style) or in
+the hostname (`demo.s3.example.com/readme.md`, virtual-hosted style). Path
+style needs no configuration and is what the block above uses: the AWS CLI
+picks it whenever `--endpoint-url` names a custom endpoint.
+
+Virtual-hosted style has to be turned on, by naming the domains that are the
+store's own:
+
+```toml
+virtual_host_domains = ["s3.example.com"]
+```
+
+or `AKS3_VIRTUAL_HOST_DOMAINS=s3.example.com` in the environment, several
+separated by commas. A domain is a hostname with no port, since the port a
+client connects to is not part of the name it sends; a domain that carries one
+is refused at startup rather than left to match nothing. Overlapping domains
+(`example.com` alongside `s3.example.com`) are refused for the same reason: a
+host under both would name two different buckets.
+
+With `s3.example.com` configured, `demo.s3.example.com` names bucket `demo`,
+`my.data.s3.example.com` names `my.data`, and `s3.example.com` itself names no
+bucket and is read as path style. **A host that is not under a configured
+domain is also read as path style**, never guessed at as a bucket, so turning
+this on does not break clients that reach the store by service name, tailnet
+name or IP. Point DNS (a wildcard record, or `/etc/hosts` for a trial) at the
+store for the names you expect, and give TLS a certificate that covers
+`*.s3.example.com`, because a TLS wildcard matches one label only.
+
+This is what lets clients that offer no path-style option work at all — the
+AWS SDK for Java v2 and things built on it, Unity Catalog included.
+`crates/server/tests/vhost.rs` drives it end to end with signatures the AWS SDK
+for Rust produced, including the case that keeps path style working while a
+domain is set.
 
 ### Known limitations
 
