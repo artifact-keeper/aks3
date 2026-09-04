@@ -60,6 +60,10 @@ pub const ENV_ROOT_USER: &str = "AKS3_ROOT_USER";
 pub const ENV_ROOT_PASSWORD: &str = "AKS3_ROOT_PASSWORD";
 /// Environment variable naming the shutdown grace period, in seconds.
 pub const ENV_SHUTDOWN_GRACE: &str = "AKS3_SHUTDOWN_GRACE";
+/// Environment variable naming the domains under which a subdomain is a
+/// bucket, comma-separated. Empty or unset leaves virtual-hosted-style
+/// addressing off.
+pub const ENV_VIRTUAL_HOST_DOMAINS: &str = "AKS3_VIRTUAL_HOST_DOMAINS";
 
 /// Reasons the server cannot work out what to start as.
 #[derive(Debug, thiserror::Error)]
@@ -131,6 +135,14 @@ pub struct Config {
     /// How many seconds a shutdown gives the connections still in flight to
     /// finish before dropping them. Zero drops them at once.
     pub shutdown_grace_seconds: u64,
+    /// Domains under which a subdomain of the host names a bucket
+    /// (virtual-hosted-style addressing). Empty leaves it off, and every
+    /// request is read as path style.
+    ///
+    /// Normalized on load: lowercased, without a port, and checked so that no
+    /// domain is a suffix of another. See [`crate::host`] for what matching
+    /// one does and, more to the point, what not matching one does not do.
+    pub virtual_host_domains: Vec<String>,
     /// TLS material, or `None` to serve plain HTTP.
     pub tls: Option<TlsConfig>,
 }
@@ -149,6 +161,7 @@ struct FileConfig {
     root_access_key: Option<String>,
     root_secret_key: Option<String>,
     shutdown_grace_seconds: Option<u64>,
+    virtual_host_domains: Option<Vec<String>>,
     tls: Option<TlsConfig>,
 }
 
@@ -203,9 +216,103 @@ impl Config {
                 env(ENV_SHUTDOWN_GRACE).as_deref(),
                 file.shutdown_grace_seconds,
             )?,
+            virtual_host_domains: virtual_host_domains(
+                env(ENV_VIRTUAL_HOST_DOMAINS).as_deref(),
+                file.virtual_host_domains,
+            )?,
             tls: file.tls,
         })
     }
+}
+
+/// Settles the virtual-host domains from the two sources and checks each one
+/// can actually match a `Host` header.
+///
+/// The environment form is comma-separated, because that is the only list an
+/// environment variable can carry; blanks around the commas are trimmed and an
+/// empty element is dropped, so `AKS3_VIRTUAL_HOST_DOMAINS=` and
+/// `AKS3_VIRTUAL_HOST_DOMAINS=" "` both mean "off" rather than "one nameless
+/// domain". A set variable always replaces the file's list rather than adding
+/// to it, which is the rule every other setting here follows.
+///
+/// What is rejected is anything that could never match. A port is the likeliest
+/// mistake (`s3.example.com:9000`, copied from an endpoint URL): the port is
+/// not part of a hostname, so the domain would match nothing and
+/// virtual-hosted-style requests would silently stay path style. Overlapping
+/// domains are rejected too, since a host under both has two answers and the
+/// order of a config file should not decide which.
+fn virtual_host_domains(
+    from_env: Option<&str>,
+    from_file: Option<Vec<String>>,
+) -> Result<Vec<String>, ConfigError> {
+    /// The name to report either source under, which is the file's key.
+    const SETTING: &str = "virtual_host_domains";
+
+    let listed: Vec<String> = match from_env {
+        Some(text) => text
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect(),
+        None => from_file
+            .unwrap_or_default()
+            .iter()
+            .map(|domain| domain.trim().to_ascii_lowercase())
+            .filter(|domain| !domain.is_empty())
+            .collect(),
+    };
+
+    let mut domains: Vec<String> = Vec::with_capacity(listed.len());
+    for domain in listed {
+        let invalid = |expected: &'static str| ConfigError::Invalid {
+            setting: SETTING,
+            value: domain.clone(),
+            expected,
+        };
+        if domain.contains(':') {
+            return Err(invalid(
+                "a hostname without a port, such as \"s3.example.com\" (the port a client \
+                 connects to is not part of the name it sends)",
+            ));
+        }
+        if !is_hostname(&domain) {
+            return Err(invalid(
+                "a hostname of dot-separated letters, digits and hyphens, such as \
+                 \"s3.example.com\"",
+            ));
+        }
+        if let Some(other) = domains
+            .iter()
+            .find(|other| domain.ends_with(other.as_str()) || other.ends_with(&domain))
+        {
+            return Err(ConfigError::Invalid {
+                setting: SETTING,
+                value: format!("{domain} and {other}"),
+                expected: "domains that do not overlap, so that a host under one of them \
+                           names one bucket",
+            });
+        }
+        domains.push(domain);
+    }
+    Ok(domains)
+}
+
+/// Whether `s` is a hostname: dot-separated labels of letters, digits and
+/// hyphens, none of them empty.
+///
+/// Deliberately narrow. This is a domain an operator typed into a config file,
+/// not a name resolved from the wire, so the cost of refusing an exotic-but-legal
+/// name is a clear error at startup, while the cost of accepting a malformed one
+/// is a matching rule that never fires.
+fn is_hostname(s: &str) -> bool {
+    !s.is_empty()
+        && s.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
 }
 
 /// Settles the drain window from the two sources and checks it is one the
@@ -255,6 +362,7 @@ impl fmt::Debug for Config {
             .field("root_access_key", &self.root_access_key)
             .field("root_secret_key", &"[REDACTED]")
             .field("shutdown_grace_seconds", &self.shutdown_grace_seconds)
+            .field("virtual_host_domains", &self.virtual_host_domains)
             .field("tls", &self.tls)
             .finish()
     }
@@ -264,7 +372,7 @@ impl fmt::Debug for Config {
 mod tests {
     use super::{
         Config, ConfigError, ENV_DATA_DIR, ENV_LISTEN, ENV_ROOT_PASSWORD, ENV_ROOT_USER,
-        ENV_SHUTDOWN_GRACE,
+        ENV_SHUTDOWN_GRACE, ENV_VIRTUAL_HOST_DOMAINS,
     };
 
     /// A config file with every setting the server needs.
@@ -550,6 +658,117 @@ mod tests {
     /// environment is process-wide, so the guard also holds a lock: two of
     /// these running at once on different test threads would restore each
     /// other's saved values.
+    #[test]
+    fn virtual_hosted_style_is_off_by_default() {
+        let env = [
+            (ENV_ROOT_USER, "admin"),
+            (ENV_ROOT_PASSWORD, "secretpassword"),
+        ];
+        let c = Config::load_from(None, stub_env(&env)).unwrap();
+        assert!(c.virtual_host_domains.is_empty());
+    }
+
+    #[test]
+    fn virtual_host_domains_come_from_the_file() {
+        let (_dir, path) = config_file(
+            r#"
+            root_access_key = "admin"
+            root_secret_key = "secretpassword"
+            virtual_host_domains = ["S3.Example.com", "objects.example.net"]
+        "#,
+        );
+        let c = Config::load_from(Some(&path), stub_env(&[])).unwrap();
+        assert_eq!(
+            c.virtual_host_domains,
+            ["s3.example.com", "objects.example.net"]
+        );
+    }
+
+    #[test]
+    fn virtual_host_domains_in_the_environment_are_comma_separated_and_win() {
+        let (_dir, path) = config_file(
+            r#"
+            root_access_key = "admin"
+            root_secret_key = "secretpassword"
+            virtual_host_domains = ["from.the.file"]
+        "#,
+        );
+        let env = [(
+            ENV_VIRTUAL_HOST_DOMAINS,
+            " s3.example.com , objects.example.net ,",
+        )];
+        let c = Config::load_from(Some(&path), stub_env(&env)).unwrap();
+        assert_eq!(
+            c.virtual_host_domains,
+            ["s3.example.com", "objects.example.net"]
+        );
+    }
+
+    /// Compose passes an empty string for an unset variable, and an empty
+    /// string here has to mean "off", not "one nameless domain".
+    #[test]
+    fn an_empty_virtual_host_domains_variable_means_off() {
+        let env = [
+            (ENV_ROOT_USER, "admin"),
+            (ENV_ROOT_PASSWORD, "secretpassword"),
+            (ENV_VIRTUAL_HOST_DOMAINS, " , "),
+        ];
+        let c = Config::load_from(None, stub_env(&env)).unwrap();
+        assert!(c.virtual_host_domains.is_empty());
+    }
+
+    /// The likeliest mistake: pasting the port from an endpoint URL. A domain
+    /// with a port matches no `Host` header, so it is caught at startup
+    /// instead of quietly leaving every request path style.
+    #[test]
+    fn a_virtual_host_domain_with_a_port_is_rejected() {
+        let env = [
+            (ENV_ROOT_USER, "admin"),
+            (ENV_ROOT_PASSWORD, "secretpassword"),
+            (ENV_VIRTUAL_HOST_DOMAINS, "s3.example.com:9000"),
+        ];
+        let err = Config::load_from(None, stub_env(&env)).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::Invalid { setting, value, .. }
+                if *setting == "virtual_host_domains" && value == "s3.example.com:9000"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("without a port"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_virtual_host_domain_is_rejected() {
+        for bad in [
+            "s3..example.com",
+            "s3.example.com/",
+            "under_score.example.com",
+        ] {
+            let env = [
+                (ENV_ROOT_USER, "admin"),
+                (ENV_ROOT_PASSWORD, "secretpassword"),
+                (ENV_VIRTUAL_HOST_DOMAINS, bad),
+            ];
+            let err = Config::load_from(None, stub_env(&env)).unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::Invalid { setting, .. } if *setting == "virtual_host_domains"),
+                "{bad} was accepted: {err}"
+            );
+        }
+    }
+
+    /// A host under both domains would name two different buckets, and which
+    /// one it got would depend on the order they were written in.
+    #[test]
+    fn overlapping_virtual_host_domains_are_rejected() {
+        let env = [
+            (ENV_ROOT_USER, "admin"),
+            (ENV_ROOT_PASSWORD, "secretpassword"),
+            (ENV_VIRTUAL_HOST_DOMAINS, "example.com,s3.example.com"),
+        ];
+        let err = Config::load_from(None, stub_env(&env)).unwrap_err();
+        assert!(err.to_string().contains("do not overlap"), "{err}");
+    }
+
     struct ScrubbedEnv {
         _guard: std::sync::MutexGuard<'static, ()>,
         saved: Vec<(&'static str, Option<String>)>,
@@ -569,6 +788,7 @@ mod tests {
                 ENV_ROOT_USER,
                 ENV_ROOT_PASSWORD,
                 ENV_SHUTDOWN_GRACE,
+                ENV_VIRTUAL_HOST_DOMAINS,
             ];
             let saved = names
                 .iter()

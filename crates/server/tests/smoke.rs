@@ -46,6 +46,7 @@ async fn start() -> (tempfile::TempDir, SocketAddr) {
         root_access_key: ACCESS_KEY.into(),
         root_secret_key: SECRET_KEY.into(),
         shutdown_grace_seconds: 8,
+        virtual_host_domains: Vec::new(),
         tls: None,
     };
     let (tx, rx) = tokio::sync::oneshot::channel();
