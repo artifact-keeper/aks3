@@ -78,7 +78,7 @@ jobs:
       # Its own category, so a rescan of the published image never overwrites
       # the per-architecture results the build workflow uploads.
       - name: Publish the report to code scanning
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: ${{ runner.temp }}/trivy-results.sarif
           category: trivy-published

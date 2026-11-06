@@ -177,7 +177,7 @@ jobs:
       # there, so a fork's pull request is checked, just not recorded.
       - name: Publish the report to code scanning
         if: github.event.pull_request.head.repo.fork != true
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: ${{ runner.temp }}/trivy-results.sarif
           # Distinct per architecture, or the two jobs would each overwrite
