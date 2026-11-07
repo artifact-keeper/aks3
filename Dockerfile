@@ -18,7 +18,7 @@
 # rather than a silent change. The digest is the manifest list's, not one
 # platform's, because this builds for both amd64 and arm64. Dependabot keeps
 # the pin current; see .github/dependabot.yml.
-FROM registry.access.redhat.com/ubi9/ubi:latest@sha256:5426a8f45e80a07168a30ea24d84f266094b3756624a5508cc53927e6ee39e09 AS builder
+FROM registry.access.redhat.com/ubi9/ubi:latest@sha256:1963e00991088221a3405be7eb315a3dbc0be0f1f7440f0bd537d481cf33c83e AS builder
 
 # gcc links the binary. cmake, make and perl are for aws-lc-sys, the C crypto
 # backend rustls pulls in through tokio-rustls; it builds its own libcrypto
@@ -75,7 +75,7 @@ RUN mkdir -p /rootfs/data && chmod 0775 /rootfs/data
 # ---------------------------------------------------------------------------
 # Digest-pinned for the same reasons as the builder stage above, and this one
 # matters more: it is the base of the image users actually pull.
-FROM registry.access.redhat.com/ubi9/ubi-micro:latest@sha256:7e7f79ab747bf2b452e3043dd89f388e92be4c7fdcc8b815b58adf6c99c39c95
+FROM registry.access.redhat.com/ubi9/ubi-micro:latest@sha256:6d9eff186ce3ccf399c1835265e7fd3f83bd112cc3422da2d39fd44e234aab59
 
 LABEL org.opencontainers.image.title="aks3" \
       org.opencontainers.image.description="Single-binary S3-compatible object store" \
